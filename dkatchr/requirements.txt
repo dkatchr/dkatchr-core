@@ -1,0 +1,10 @@
+# dKatchr CLI dependencies
+# Install: pip install -r dkatchr/requirements.txt
+
+requests>=2.28.0
+tqdm>=4.65.0
+cvss>=3.0
+pyahocorasick>=2.0.0
+rapidfuzz>=3.0.0        # Damerau-Levenshtein for typosquat detection; C++-backed, ships manylinux wheels (same posture as pyahocorasick)
+dotnetfile>=0.2.0
+python-dotenv>=1.0.0   # reads GITHUB_TOKEN from .env; not required if you export it directly

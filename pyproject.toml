@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dkatchr"
+version = "0.3.0"
+description = "Multi-ecosystem GitHub dependency scanner with OSV enrichment"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.28.0",
+    "tqdm>=4.65.0",
+    "cvss>=3.0",
+    "pyahocorasick>=2.0.0",
+    "rapidfuzz>=3.0.0",
+    "dotnetfile>=0.2.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+dkatchr = "dkatchr.cli.main:main"
+
+[tool.setuptools.packages.find]
+include = ["dkatchr*"]
