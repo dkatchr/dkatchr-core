@@ -6,6 +6,12 @@
   </picture>
 </p>
 
+<p align="center">
+  <a href="https://pypi.org/project/dkatchr/"><img alt="PyPI" src="https://img.shields.io/pypi/v/dkatchr"></a>
+  <a href="https://pypi.org/project/dkatchr/"><img alt="Python versions" src="https://img.shields.io/pypi/pyversions/dkatchr"></a>
+  <a href="https://github.com/dkatchr/dkatchr-core/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/pypi/l/dkatchr"></a>
+</p>
+
 # dKatchr
 
 Multi-ecosystem Software Composition Analysis (SCA) scanner for GitHub. Point it at one or more GitHub orgs (or a specific list of repos), and it discovers every dependency manifest across 8 package ecosystems, enriches findings against multiple vulnerability intelligence sources, and flags supply-chain risks that plain CVE scanning misses - dependency confusion, typosquatting, and unauthenticated internal-name exposure.
