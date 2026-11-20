@@ -149,3 +149,22 @@ def test_nuget_normalize():
     assert _nuget_normalize("4.0.0.0") == "4.0.0"
     assert _nuget_normalize("1.2.3.4") == "1.2.3.4"
     assert _nuget_normalize("2.0.0-Beta1+sha") == "2.0.0-beta1"
+
+
+# ---- monorepos: rules apply per directory (sub-project), not per repo -------
+
+def test_other_subprojects_pins_do_not_block_transitive_rows():
+    # galileo: components/a/poetry.lock pins certifi, but tools/requirements.txt
+    # (no lockfile) still installs certifi through requests.
+    inv = [_row("components/a/poetry.lock", "PyPI", "certifi", "2021.5.30", src="resolved"),
+           _row("tools/requirements.txt", "PyPI", "requests", "2.25.0")]
+    added = expand_transitive(inv, _lookup([]), SUPPORTED, 100)
+    assert ("certifi", "2026.10.23") in {(r["package"], r["version"]) for r in added}
+    assert all(r["file"] == "tools/requirements.txt" for r in added)
+
+
+def test_same_package_in_two_modules_gets_a_row_per_module():
+    inv = [_row("mod-a/pom.xml", "Maven", "com.fasterxml.jackson.core:jackson-databind", "2.9.10"),
+           _row("mod-b/pom.xml", "Maven", "com.fasterxml.jackson.core:jackson-databind", "2.9.10")]
+    added = expand_transitive(inv, _lookup([]), SUPPORTED, 100)
+    assert sorted({r["file"] for r in added}) == ["mod-a/pom.xml", "mod-b/pom.xml"]

@@ -66,7 +66,9 @@ ATTRIBUTION_CACHE_SCHEMA: int = 1
 #     manifest marks development/test-only.
 # v9: transitive rows (version_source "transitive") for lockfile-less
 #     manifests, resolved via deps.dev / the NuGet registry.
-CACHE_SCHEMA = 9
+# v10: transitive rows and "already pinned" decided per directory (monorepo
+#      sub-projects), `pinned` on requirements `==` rows.
+CACHE_SCHEMA = 10
 
 # Bundler group names that mean "not installed in production" — the
 # conventional names (`bundle config set without development test`), not a

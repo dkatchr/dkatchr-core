@@ -96,11 +96,16 @@ def from_requirements_txt(text: str) -> list[dict]:
 
         m = _REQ_RE.match(line)
         if m:
-            deps.append({
+            dep = {
                 "package":        m.group(1),
                 "version":        m.group(3),
                 "version_source": "declared",
-            })
+            }
+            # `==` / `===` is an exact pin: pip installs exactly this version,
+            # so it is queried even when a lockfile nearby resolves another.
+            if m.group(2) in ("==", "==="):
+                dep["pinned"] = True
+            deps.append(dep)
     return deps
 
 

@@ -166,3 +166,42 @@ def test_malware_markers():
     assert not _flags("NLTK: Missing Post-Download Integrity Verification "
                       "Allows Malicious Package Injection")
     assert not _flags("Babel vulnerable when compiling specifically crafted malicious code")
+
+
+def _queried(inv):
+    queried = []
+
+    class _Osv:
+        def get_cached_ids(self, *t):
+            return None
+
+        def query_batch(self, chunk):
+            queried.extend(chunk)
+            return [[] for _ in chunk]
+
+        def set_cached_ids(self, *a):
+            pass
+
+        def save_index(self):
+            pass
+
+    osv_enrich({"o/r": inv}, _Osv())
+    return queried
+
+
+def test_declared_version_skipped_only_by_a_lockfile_in_the_same_directory():
+    inv = dedupe_inventory(
+        extract_file_inventory("a/poetry.lock", '[[package]]\nname = "urllib3"\nversion = "1.26.5"\n')
+        + extract_file_inventory("b/requirements.txt", "urllib3>=2.7.0\n")
+        + extract_file_inventory("c/requirements.txt", "urllib3>=2.0.0\n")
+        + extract_file_inventory("c/poetry.lock", '[[package]]\nname = "urllib3"\nversion = "2.2.0"\n'))
+    q = _queried(inv)
+    assert ("PyPI", "urllib3", "2.7.0") in q        # other sub-project's lock doesn't hide it
+    assert ("PyPI", "urllib3", "2.0.0") not in q    # its own lock resolves the range
+
+
+def test_exact_pin_is_always_queried():
+    inv = dedupe_inventory(
+        extract_file_inventory("d/poetry.lock", '[[package]]\nname = "lxml"\nversion = "4.9.2"\n')
+        + extract_file_inventory("d/requirements.txt", "lxml==6.0.2\n"))
+    assert ("PyPI", "lxml", "6.0.2") in _queried(inv)

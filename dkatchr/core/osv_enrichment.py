@@ -9,6 +9,7 @@ query, how to batch, how to pull fields out of vuln records, how to shape
 output rows. The client (now clients/osv.py) is just the network layer.
 """
 
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from dkatchr.clients.osv import OSVClient
@@ -206,8 +207,9 @@ def osv_enrich(
 
     # 1. Build the unique tuple set.
     #    Deduplication: for any (ecosystem, package) pair where both a
-    #    "resolved" and a "declared" entry exist in a repo's inventory, use
-    #    only the resolved version for OSV queries.  Declared versions are
+    #    "resolved" and a "declared" entry exist in the SAME DIRECTORY, use
+    #    only the resolved version for OSV queries (an exact `==` pin —
+    #    `pinned` — is always queried: pip installs exactly that).  Declared versions are
     #    semver ranges that OSV can match even when the pinned resolved version
     #    is already patched, producing false positives.  The full inventory is
     #    NOT modified — this filtering is OSV-query-only.
@@ -219,8 +221,11 @@ def osv_enrich(
         # OSV entirely: their "version" is a raw spec ("file:../x", a git URL)
         # that would leak into batch queries as junk. This exclusion applies
         # regardless of whether the confusion pass is enabled.
-        resolved_pairs: set[tuple[str, str]] = {
-            (dep["ecosystem"], dep["package"])
+        # Keyed by DIRECTORY: in a monorepo each sub-project has its own
+        # lockfile, and one sub-project's resolved urllib3 says nothing about
+        # the version another sub-project's requirements.txt pins.
+        resolved_pairs: set[tuple[str, str, str]] = {
+            (dep["ecosystem"], dep["package"], os.path.dirname(dep.get("file", "")))
             for dep in inv
             if dep.get("version_source") == "resolved"
             and dep.get("package")
@@ -238,7 +243,8 @@ def osv_enrich(
                 continue
             # Skip declared entry when a resolved pin exists for the same
             # (ecosystem, package) in this repo — prefer the exact version.
-            if dep.get("version_source") == "declared" and (eco, dep["package"]) in resolved_pairs:
+            if (dep.get("version_source") == "declared" and not dep.get("pinned")
+                    and (eco, dep["package"], os.path.dirname(dep.get("file", ""))) in resolved_pairs):
                 continue
             unique.add((eco, dep["package"], dep["version"]))
 
