@@ -73,6 +73,18 @@ CACHE_SCHEMA = 9
 # per-package map. A gem counts as dev-only when ALL its groups are in here.
 GEMFILE_DEV_GROUPS = frozenset({"development", "test", "dev", "ci", "lint", "rubocop"})
 
+# ---- Manifest fetching -----------------------------------------------------
+# Manifests are fetched one contents-API call each. A monorepo with hundreds of
+# modules (486 pom.xml, 339 .csproj) burns minutes and most of the 5,000/h API
+# budget that way, so above this many manifests the scan reads them all out of
+# ONE repo tarball instead — when the repo is small enough (GitHub's `size`,
+# KB) that downloading it is cheaper. Anything the tarball does not deliver
+# falls back to per-file calls.
+SCAN_TARBALL_MIN_MANIFESTS = int(os.environ.get("DKATCHR_SCAN_TARBALL_MIN_MANIFESTS", "30"))
+SCAN_TARBALL_MAX_REPO_KB = int(os.environ.get("DKATCHR_SCAN_TARBALL_MAX_REPO_KB", str(2 * 1024 * 1024)))
+# Per-member read cap while extracting manifests from the tarball.
+SCAN_TARBALL_MAX_MANIFEST_BYTES = 100 * 1024 * 1024
+
 # Reachability cache (per repo + SHA) stores the matched import patterns, so a
 # change to pattern generation must invalidate it. v2: Go subpackage-import
 # patterns ('"module/').
