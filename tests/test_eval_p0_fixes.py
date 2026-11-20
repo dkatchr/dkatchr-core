@@ -205,3 +205,24 @@ def test_exact_pin_is_always_queried():
         extract_file_inventory("d/poetry.lock", '[[package]]\nname = "lxml"\nversion = "4.9.2"\n')
         + extract_file_inventory("d/requirements.txt", "lxml==6.0.2\n"))
     assert ("PyPI", "lxml", "6.0.2") in _queried(inv)
+
+
+# ---- fix versions belong to the finding's own package -------------------------
+
+from dkatchr.core.osv_enrichment import osv_fix_versions
+
+
+def test_fix_versions_only_for_own_package_and_never_commits():
+    rec = {"affected": [
+        {"package": {"ecosystem": "Go", "name": "golang.org/x/net"},
+         "ranges": [{"type": "SEMVER", "events": [{"introduced": "0"}, {"fixed": "0.17.0"}]}]},
+        {"package": {"ecosystem": "Maven", "name": "org.eclipse.jetty:jetty-server"},
+         "ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "9.0"}, {"fixed": "9.4.53"}]}]},
+        {"package": {"ecosystem": "PyPI", "name": "Pillow"},
+         "ranges": [{"type": "GIT", "events": [{"fixed": "9e08eb8f78fdfd2f476e1b20b7cf38683754866b"}]},
+                    {"type": "ECOSYSTEM", "events": [{"introduced": "0"}, {"fixed": "10.3.0"}]}]},
+    ]}
+    assert osv_fix_versions(rec, "Go", "golang.org/x/net") == "0.17.0"
+    assert osv_fix_versions(rec, "PyPI", "pillow") == "10.3.0"
+    assert "9e08eb8f" not in osv_fix_versions(rec)                  # legacy call: still no commits
+    assert osv_fix_versions(rec, "npm", "unrelated") == "0.17.0,10.3.0,9.4.53"   # no own entry: fallback
