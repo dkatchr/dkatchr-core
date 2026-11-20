@@ -31,6 +31,7 @@ from dkatchr.core.inventory import (
     extract_maven_project_inventory,
 )
 from dkatchr.core.rules import apply_rules
+from dkatchr.core.transitive import expand_transitive
 from dkatchr.logger import log, repo_log
 from dkatchr.parsers import manifest_handler
 from dkatchr.storage.inventory_cache import InventoryCache
@@ -47,10 +48,14 @@ class Scanner:
         github: GitHubClient,
         cache: InventoryCache,
         package_config: dict,
+        transitive_resolver=None,
     ) -> None:
         self.github         = github
         self.cache          = cache
         self.package_config = package_config
+        # Optional TransitiveResolver: adds the packages that direct
+        # dependencies of lockfile-less manifests pull in. None = off.
+        self.transitive     = transitive_resolver
 
     def scan_repo(self, repo: dict, prefix: str, full_rescan: bool,
                    on_progress: ProgressCb = None) -> dict:
@@ -171,6 +176,23 @@ class Scanner:
                     log(f"    [!] {full_name}: Maven project resolution failed ({e}); parsing poms per file")
                     for path, content in poms.items():
                         inventory.extend(extract_file_inventory(path, content))
+
+            if self.transitive is not None and inventory:
+                from dkatchr.config import TRANSITIVE_MAX_ROOTS_PER_REPO
+
+                def _tp(p: dict) -> None:
+                    if on_progress:
+                        on_progress({**p, "full_name": full_name})
+                try:
+                    extra = expand_transitive(
+                        inventory, self.transitive.get_graph,
+                        self.transitive.SUPPORTED_ECOSYSTEMS,
+                        TRANSITIVE_MAX_ROOTS_PER_REPO, on_progress=_tp)
+                    if extra:
+                        repo_log(f"    {full_name}: +{len(extra)} transitive dependencies")
+                    inventory.extend(extra)
+                except Exception as e:
+                    log(f"    [!] {full_name}: transitive resolution failed: {e}")
 
             try:
                 self.cache.write(owner, name, inventory)
