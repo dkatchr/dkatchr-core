@@ -58,6 +58,10 @@ from dkatchr.clients.github import GitHubClient, TarballSizeExceeded
 from dkatchr.clients.resolvers import ImportNameResolver
 from dkatchr.config import (
     GRAPH_MAX_PROBE_PACKAGES,
+    REACHABILITY_COMMAND_FILE_NAMES,
+    REACHABILITY_COMMAND_FILE_PREFIXES,
+    REACHABILITY_COMMAND_FILE_SUFFIXES,
+    REACHABILITY_COMMAND_MIN_LEN,
     REACHABILITY_MAX_FILE_BYTES,
     REACHABILITY_SCAN_PROGRESS_EVERY,
     REACHABILITY_SNIPPET_MAX_CHARS,
@@ -83,6 +87,42 @@ UNKNOWN   = "UNKNOWN"
 
 
 # ---- file classification ---------------------------------------------------
+
+def _is_command_file(path: str) -> bool:
+    """Files where programs are RUN: Dockerfiles, Procfiles, Makefiles, shell
+    scripts, service/CI/compose YAML, supervisor/ini configs."""
+    base = path.rsplit("/", 1)[-1]
+    return (base in REACHABILITY_COMMAND_FILE_NAMES
+            or base.startswith(REACHABILITY_COMMAND_FILE_PREFIXES)
+            or base.lower().endswith(REACHABILITY_COMMAND_FILE_SUFFIXES))
+
+
+def _is_manifest_path(path: str) -> bool:
+    """A dependency manifest: naming a package there declares it, it does not
+    run it, so command patterns never count in these files."""
+    from dkatchr.parsers import manifest_handler
+    base = path.rsplit("/", 1)[-1]
+    return manifest_handler(base) is not None or base.endswith(".gemspec")
+
+
+def build_command_patterns(commands: list[str]) -> tuple[list[str], list[str]]:
+    """(quoted, bare) search strings for invocations of the given programs.
+    quoted — `"ocrmypdf"`, `'ocrmypdf '` …: argv lists, os.system strings,
+             exec-form CMD; counted in source AND command files.
+    bare   — ` ocrmypdf `, line-start `ocrmypdf ` …: shell lines; counted in
+             command files only (in source code a bare word is usually prose).
+    Names shorter than REACHABILITY_COMMAND_MIN_LEN are ignored."""
+    quoted: set[str] = set()
+    bare: set[str] = set()
+    for c in commands or []:
+        if not c or len(c) < REACHABILITY_COMMAND_MIN_LEN or any(ch.isspace() for ch in c):
+            continue
+        for q in ('"', "'", "`"):
+            quoted.update({f"{q}{c}{q}", f"{q}{c} "})
+        for lead in ("\n", " ", "\t", "=", "/"):
+            bare.update({f"{lead}{c} ", f"{lead}{c}\n"})
+    return sorted(quoted), sorted(bare)
+
 
 def _is_test_file(path: str) -> bool:
     lower = path.lower()
@@ -316,6 +356,8 @@ def _grep_tar_stream(
     allow_early_exit: bool = True,
     detail_patterns: set[str] | frozenset[str] | None = None,
     detail_hits_out: dict[str, list[dict]] | None = None,
+    command_patterns: set[str] | frozenset[str] | None = None,
+    bare_command_patterns: set[str] | frozenset[str] | None = None,
 ) -> dict[str, list[str]]:
     """
     Stream a gzipped tarball through tarfile in r|gz mode, applying
@@ -340,6 +382,11 @@ def _grep_tar_stream(
     need call-site anchors; the file paths are tar member names (which carry
     the archive's root directory prefix — callers strip it for display).
 
+    `command_patterns` / `bare_command_patterns` (program invocations, see
+    build_command_patterns): command files (Dockerfile, *.sh, Procfile, …)
+    are scanned too, but ONLY these patterns count there; bare forms count
+    only there; and no command pattern counts in a dependency manifest.
+
     `on_progress` (optional) is called every REACHABILITY_SCAN_PROGRESS_EVERY
     tar members with a dict:
       {"phase": "scanning_progress", "members_seen": N,
@@ -352,6 +399,8 @@ def _grep_tar_stream(
     total_patterns = len(all_patterns)
     detail_patterns = detail_patterns or frozenset()
     capture_details = detail_hits_out is not None and bool(detail_patterns)
+    command_patterns = command_patterns or frozenset()
+    bare_command_patterns = bare_command_patterns or frozenset()
 
     members_seen  = 0
     files_scanned = 0
@@ -392,10 +441,13 @@ def _grep_tar_stream(
                 if members_seen % REACHABILITY_SCAN_PROGRESS_EVERY == 0:
                     _tick()
                 continue
-            if not _is_source_file(member.name):
+            is_source = _is_source_file(member.name)
+            is_command = bool(command_patterns) and not is_source and _is_command_file(member.name)
+            if not (is_source or is_command):
                 if members_seen % REACHABILITY_SCAN_PROGRESS_EVERY == 0:
                     _tick()
                 continue
+            in_manifest = bool(command_patterns) and _is_manifest_path(member.name)
             if exclude_test_files and _is_test_file(member.name):
                 files_skipped += 1
                 if members_seen % REACHABILITY_SCAN_PROGRESS_EVERY == 0:
@@ -424,10 +476,17 @@ def _grep_tar_stream(
 
             files_scanned += 1
             last_file = member.name
+            if is_command:
+                content = "\n" + content          # line-start forms match on line 1 too
 
             found_in_file: set[str] = set()
             detailed_in_file: set[str] = set()
             for end_idx, pattern in automaton.iter(content):
+                if pattern in command_patterns:
+                    if in_manifest or (pattern in bare_command_patterns and not is_command):
+                        continue
+                elif is_command:
+                    continue                      # import patterns: source files only
                 found_in_file.add(pattern)
                 if (capture_details and pattern in detail_patterns
                         and pattern not in detailed_in_file):
@@ -620,9 +679,13 @@ def enrich_reachability(
                 versions=retry_versions,
             )
             updated = False
+            retry_commands = resolver.commands_for(missing_pairs)
             for (package, ecosystem) in missing_pairs:
                 names = retry_resolved.get((package, ecosystem), [])
                 patterns = _build_patterns(names, ecosystem)
+                if patterns:
+                    quoted, bare = build_command_patterns(retry_commands.get((package, ecosystem), []))
+                    patterns = patterns + quoted + bare
                 if not patterns:
                     # Resolution failed again. Leave the package out of
                     # results so _apply_results_to_rows falls back to
@@ -698,10 +761,22 @@ def enrich_reachability(
     )
 
     # ---- 3. build patterns from resolved names ------------------------
+    # Plus the package's own programs: running `ocrmypdf` uses the ocrmypdf
+    # package (and, through the dependency graph, pillow) as surely as
+    # importing it does.
+    commands = resolver.commands_for(unique_pairs)
     pair_patterns: dict[tuple[str, str], list[str]] = {}
+    command_patterns: set[str] = set()
+    bare_command_patterns: set[str] = set()
     for key in unique_pairs:
         names = resolved.get(key, [])
-        pair_patterns[key] = _build_patterns(names, key[1])
+        patterns = _build_patterns(names, key[1])
+        if patterns:
+            quoted, bare = build_command_patterns(commands.get(key, []))
+            command_patterns.update(quoted, bare)
+            bare_command_patterns.update(bare)
+            patterns = patterns + quoted + bare
+        pair_patterns[key] = patterns
 
     all_patterns = sorted({p for patterns in pair_patterns.values() for p in patterns})
 
@@ -761,6 +836,8 @@ def enrich_reachability(
                     allow_early_exit=not extras,
                     detail_patterns=frozenset(extras),
                     detail_hits_out=extra_hits_out,
+                    command_patterns=frozenset(command_patterns),
+                    bare_command_patterns=frozenset(bare_command_patterns),
                 )
             except TarballSizeExceeded as e:
                 stream_reason = e.reason

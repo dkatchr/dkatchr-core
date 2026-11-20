@@ -215,7 +215,10 @@ class ImportNameResolver:
                         })
                         continue
 
-                    names, source = outcome
+                    # Resolvers return (names, source) or, where the artifact
+                    # also lists installed programs, (names, source, commands).
+                    names, source = outcome[0], outcome[1]
+                    commands = list(outcome[2]) if len(outcome) > 2 else []
                     # Defensive: never let an empty result reach the cache.
                     cleaned = [n for n in (names or []) if isinstance(n, str) and n]
                     if not cleaned:
@@ -230,7 +233,7 @@ class ImportNameResolver:
                         continue
 
                     results[(package, ecosystem)] = cleaned
-                    self._cache_write(package, ecosystem, cleaned, source)
+                    self._cache_write(package, ecosystem, cleaned, source, commands)
                     resolved_count += 1
                     _emit(on_progress, {
                         "phase":     "resolved",
@@ -299,6 +302,7 @@ class ImportNameResolver:
         ecosystem: str,
         names: list[str],
         source: str,
+        commands: list[str] | None = None,
     ) -> None:
         if not names:
             return
@@ -307,6 +311,10 @@ class ImportNameResolver:
             "ecosystem":    ecosystem,
             "package":      package,
             "import_names": names,
+            # Programs the package installs (PyPI console/gui scripts, gem
+            # executables). Reachability treats an invocation of one in the
+            # repo (subprocess call, Dockerfile, shell script) as use.
+            "commands":     [c for c in (commands or []) if isinstance(c, str) and c],
             "source":       source,
             "resolved_at":  datetime.now(timezone.utc).isoformat(),
         }
@@ -324,6 +332,25 @@ class ImportNameResolver:
                     os.remove(tmp)
             except Exception:
                 pass
+
+
+    def commands_for(self, pairs: list[tuple[str, str]]) -> dict[tuple[str, str], list[str]]:
+        """{(package, ecosystem): [command, ...]} from the cache entries
+        resolve_batch() wrote — no network. Packages without programs (and
+        npm/go, whose names short-circuit) map to []."""
+        out: dict[tuple[str, str], list[str]] = {}
+        for package, ecosystem in pairs:
+            path = self._cache_path(package, _normalize_ecosystem(ecosystem))
+            cmds: list[str] = []
+            try:
+                with open(path, encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict) and data.get("schema") == self.SCHEMA:
+                    cmds = [c for c in data.get("commands") or [] if isinstance(c, str) and c]
+            except (OSError, ValueError):
+                pass
+            out[(package, ecosystem)] = cmds
+        return out
 
 
 def _emit(cb: ProgressCb, payload: dict) -> None:

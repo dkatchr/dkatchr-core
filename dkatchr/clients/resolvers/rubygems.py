@@ -21,14 +21,31 @@ The fallback is narrow: only triggered when `lib/` is genuinely empty.
 Does NOT: cache, normalize names.
 """
 
+import gzip
 import io
 import os
+import re
 import tarfile
 
 from dkatchr.clients.resolvers._base import RegistryResolverBase
 from dkatchr.logger import log
 
 _RUBYGEMS_API = "https://rubygems.org/api/v1/gems/{gem}.json"
+
+
+def gemspec_executables(metadata_yaml: str) -> list[str]:
+    """`executables:` list of a .gem's metadata (YAML gemspec), read with a
+    line scan — the YAML carries Ruby object tags a safe loader rejects."""
+    m = re.search(r"^executables:[ \t]*(\[\][ \t]*)?$", metadata_yaml, re.MULTILINE)
+    if not m or m.group(1):
+        return []
+    out: list[str] = []
+    for line in metadata_yaml[m.end():].splitlines()[1:]:
+        item = re.match(r"^-[ \t]+['\"]?([^'\"\s]+)['\"]?\s*$", line)
+        if not item:
+            break
+        out.append(item.group(1))
+    return sorted(set(out))
 
 
 class RubyGemsResolver(RegistryResolverBase):
@@ -59,6 +76,16 @@ class RubyGemsResolver(RegistryResolverBase):
 
         with outer:
             data_member = None
+            commands: list[str] = []
+            for member in outer.getmembers():
+                if member.isfile() and member.name == "metadata.gz":
+                    try:
+                        mf = outer.extractfile(member)
+                        if mf is not None:
+                            commands = gemspec_executables(
+                                gzip.decompress(mf.read()).decode("utf-8", errors="ignore"))
+                    except Exception as e:  # commands are optional — never fail the resolve
+                        log(f"[resolver] rubygems/{package}: metadata.gz unreadable: {e}")
             for member in outer.getmembers():
                 if member.isfile() and member.name == "data.tar.gz":
                     data_member = member
@@ -127,6 +154,6 @@ class RubyGemsResolver(RegistryResolverBase):
                 f"[resolver] rubygems/{package}: lib/ empty — meta-gem fallback "
                 f"to gem name for module patterns"
             )
-            return [package], "gem_name_fallback"
+            return [package], "gem_name_fallback", commands
 
-        return sorted(requires), "gem_lib_files"
+        return sorted(requires), "gem_lib_files", commands
