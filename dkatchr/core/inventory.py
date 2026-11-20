@@ -68,6 +68,8 @@ def _to_row(file_path: str, ecosystem: str, dep: dict) -> dict:
     # configurations, npm lockfile dev flags). Absent = runtime or unknown.
     if dep.get("scope") == "dev":
         row["scope"] = "dev"
+    if dep.get("pinned"):
+        row["pinned"] = True
     return row
 
 
