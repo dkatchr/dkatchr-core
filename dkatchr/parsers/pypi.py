@@ -1,4 +1,4 @@
-"""PyPI: requirements.txt, Pipfile.lock, poetry.lock.
+"""PyPI: requirements*.txt, Pipfile.lock, poetry.lock, setup.py, setup.cfg, pyproject.toml.
 
 Dependency `resolved_url` (Dependency Confusion Exposure signal): the two
 lockfiles record which index served each package, and the parsers carry it —
@@ -134,6 +134,8 @@ def from_pipfile_lock(text: str) -> list[dict]:
                     sole_source_url if "index" not in meta else None)
                 if resolved_url:
                     dep["resolved_url"] = resolved_url
+                if section == "develop":
+                    dep["scope"] = "dev"
                 deps.append(dep)
                 continue
             # Version-less entries are VCS/path installs: {"git": url, "ref": …}
@@ -195,6 +197,17 @@ def from_poetry_lock(text: str) -> list[dict]:
         # Edges for dependency-graph reachability. poetry.lock lists every
         # package's dependencies (incl. optional/extra-gated ones — kept: an
         # over-approximated edge can only over-flag), so edges are known.
+        # Dev-only packages: poetry < 1.2 wrote `category = "dev"`; lock
+        # format 2.1 writes `groups = [...]` (anything without "main" is not
+        # installed for the main group).
+        cat_m = re.search(r'^category\s*=\s*"([^"]+)"', head, re.MULTILINE)
+        groups_m = re.search(r'^groups\s*=\s*\[([^\]]*)\]', head, re.MULTILINE)
+        if cat_m and cat_m.group(1) == "dev":
+            dep["scope"] = "dev"
+        elif groups_m:
+            groups = re.findall(r'"([^"]+)"', groups_m.group(1))
+            if groups and "main" not in groups:
+                dep["scope"] = "dev"
         deps_m = _POETRY_DEPS_RE.search(section)
         dep["depends_on"] = _POETRY_DEP_NAME_RE.findall(deps_m.group(1)) if deps_m else []
         src_m = _POETRY_SOURCE_RE.search(section)
@@ -221,4 +234,147 @@ def from_poetry_lock(text: str) -> list[dict]:
                 # decides public vs private by host.
                 dep["resolved_url"] = src_url
         deps.append(dep)
+    return deps
+
+
+# ---- declared-dependency manifests (setup.py / setup.cfg / pyproject.toml) ----
+#
+# These record what a project ASKS for, not what got installed. Their value is
+# twofold: OSV coverage for repos with no lockfile, and marking a package as a
+# direct dependency (dependency_scope / the reachability graph's roots). All
+# rows are version_source "declared"; a bare name with no version specifier is
+# skipped, matching from_requirements_txt.
+
+def _pep508_rows(specs: list[str], scope: str | None = None) -> list[dict]:
+    rows = from_requirements_txt("\n".join(s for s in specs if isinstance(s, str)))
+    if scope:
+        for r in rows:
+            r["scope"] = scope
+    return rows
+
+
+def _str_list(node, assigns: dict) -> list[str]:
+    """Literal list/tuple of strings from an AST node, following one level of
+    module-level name assignment (install_requires=REQUIRES)."""
+    import ast
+    if isinstance(node, ast.Name) and node.id in assigns:
+        node = assigns[node.id]
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return [e.value for e in node.elts
+                if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+    return []
+
+
+def from_setup_py(text: str) -> list[dict]:
+    """setup.py — install_requires / extras_require / tests_require, read
+    statically from the AST (the file is NEVER executed). Only literal lists
+    (or a module-level name bound to one) are understood; anything computed
+    at runtime (reading requirements.txt, list comprehensions) is skipped."""
+    import ast
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return []
+    assigns = {}
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 \
+                and isinstance(stmt.targets[0], ast.Name):
+            assigns[stmt.targets[0].id] = stmt.value
+    deps: list[dict] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        name = fn.id if isinstance(fn, ast.Name) else fn.attr if isinstance(fn, ast.Attribute) else ""
+        if name != "setup":
+            continue
+        for kw in node.keywords:
+            if kw.arg == "install_requires":
+                deps += _pep508_rows(_str_list(kw.value, assigns))
+            elif kw.arg == "tests_require":
+                deps += _pep508_rows(_str_list(kw.value, assigns), scope="dev")
+            elif kw.arg == "extras_require":
+                val = assigns.get(kw.value.id, kw.value) if isinstance(kw.value, ast.Name) else kw.value
+                if isinstance(val, ast.Dict):
+                    for v in val.values:
+                        deps += _pep508_rows(_str_list(v, assigns))
+    return deps
+
+
+def from_setup_cfg(text: str) -> list[dict]:
+    """setup.cfg — [options] install_requires / tests_require and
+    [options.extras_require] (one requirement per line)."""
+    import configparser
+    cp = configparser.ConfigParser(interpolation=None)
+    try:
+        cp.read_string(text)
+    except configparser.Error:
+        return []
+    def lines(section: str, key: str) -> list[str]:
+        if not cp.has_option(section, key):
+            return []
+        return [l.strip() for l in cp.get(section, key).splitlines() if l.strip()]
+    deps = _pep508_rows(lines("options", "install_requires"))
+    deps += _pep508_rows(lines("options", "tests_require"), scope="dev")
+    if cp.has_section("options.extras_require"):
+        for key in cp.options("options.extras_require"):
+            deps += _pep508_rows(lines("options.extras_require", key))
+    return deps
+
+
+def _poetry_rows(table: dict, scope: str | None = None) -> list[dict]:
+    from dkatchr.parsers._common import clean_declared_version
+    rows = []
+    for name, spec in (table or {}).items():
+        if name.lower() == "python":
+            continue
+        if isinstance(spec, dict):
+            if spec.get("git") or spec.get("path") or spec.get("url"):
+                src = spec.get("git") or spec.get("path") or spec.get("url")
+                origin = "git" if spec.get("git") else "path" if spec.get("path") else "url"
+                row = {"package": name, "version": src, "version_source": "declared", "origin": origin}
+                if scope:
+                    row["scope"] = scope
+                rows.append(row)
+                continue
+            spec = spec.get("version", "")
+        if not isinstance(spec, str):
+            continue
+        ver = clean_declared_version(spec.split(",")[0])
+        if not ver or ver == "*":
+            continue
+        row = {"package": name, "version": ver, "version_source": "declared"}
+        if scope:
+            row["scope"] = scope
+        rows.append(row)
+    return rows
+
+
+def from_pyproject_toml(text: str) -> list[dict]:
+    """pyproject.toml — PEP 621 [project] dependencies / optional-dependencies,
+    PEP 735 [dependency-groups] (dev scope), and Poetry's
+    [tool.poetry.dependencies] / [tool.poetry.group.*.dependencies] /
+    [tool.poetry.dev-dependencies]. Needs tomllib (Python 3.11+); on 3.10 the
+    file is skipped."""
+    try:
+        import tomllib
+    except ImportError:  # Python 3.10
+        return []
+    try:
+        data = tomllib.loads(text)
+    except Exception:
+        return []
+    deps: list[dict] = []
+    project = data.get("project") or {}
+    deps += _pep508_rows(project.get("dependencies") or [])
+    for extra in (project.get("optional-dependencies") or {}).values():
+        deps += _pep508_rows(extra or [])
+    for group in (data.get("dependency-groups") or {}).values():
+        deps += _pep508_rows([g for g in (group or []) if isinstance(g, str)], scope="dev")
+    poetry = (data.get("tool") or {}).get("poetry") or {}
+    deps += _poetry_rows(poetry.get("dependencies"))
+    deps += _poetry_rows(poetry.get("dev-dependencies"), scope="dev")
+    for gname, group in (poetry.get("group") or {}).items():
+        scope = None if gname == "main" else "dev"
+        deps += _poetry_rows((group or {}).get("dependencies"), scope=scope)
     return deps

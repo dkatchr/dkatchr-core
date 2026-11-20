@@ -25,7 +25,11 @@ import os
 from typing import Callable
 
 from dkatchr.clients.github import GitHubClient
-from dkatchr.core.inventory import dedupe_inventory, extract_file_inventory
+from dkatchr.core.inventory import (
+    dedupe_inventory,
+    extract_file_inventory,
+    extract_maven_project_inventory,
+)
 from dkatchr.core.rules import apply_rules
 from dkatchr.logger import log, repo_log
 from dkatchr.parsers import manifest_handler
@@ -131,6 +135,10 @@ class Scanner:
                               "total": total_manifests})
 
             inventory = []
+            # pom.xml files are resolved together after the loop: a module's
+            # versions usually live in its parent pom's <properties> /
+            # <dependencyManagement>, which a per-file parse can't see.
+            poms: dict[str, str] = {}
             for i, node in enumerate(manifest_blobs, 1):
                 path = node.get("path", "")
                 try:
@@ -144,12 +152,25 @@ class Scanner:
                 if not content:
                     continue
 
-                inventory.extend(extract_file_inventory(path, content))
+                if os.path.basename(path) == "pom.xml":
+                    poms[path] = content
+                else:
+                    inventory.extend(extract_file_inventory(path, content))
 
                 # Tick every 5 manifests (or at the end). Cheap, keeps UI alive.
                 if on_progress and (i % 5 == 0 or i == total_manifests):
                     on_progress({"phase": "fetching_manifests", "full_name": full_name,
                                   "fetched": i, "total": total_manifests})
+
+            if poms:
+                try:
+                    inventory.extend(extract_maven_project_inventory(poms))
+                except Exception as e:
+                    # Never lose the poms over a resolution bug: fall back to
+                    # the per-file parse.
+                    log(f"    [!] {full_name}: Maven project resolution failed ({e}); parsing poms per file")
+                    for path, content in poms.items():
+                        inventory.extend(extract_file_inventory(path, content))
 
             try:
                 self.cache.write(owner, name, inventory)

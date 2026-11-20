@@ -15,6 +15,7 @@ lockfiles) is ambiguous per spec — no resolved_url is attributed there.
 
 import re
 
+from dkatchr.config import GEMFILE_DEV_GROUPS
 from dkatchr.parsers._common import clean_declared_version
 
 # `gem 'name'` line with everything after the name captured for option scanning.
@@ -29,10 +30,44 @@ _ORIGIN_OPT = re.compile(
 )
 
 
+# `group :development, :test do` … `end` blocks, and inline `group: :test` /
+# `groups: [:development, :test]` options.
+_GROUP_OPEN = re.compile(r"^\s*group\s+(.+?)\s+do\b")
+_INLINE_GROUP = re.compile(r"\bgroups?\s*(?::|=>)\s*(\[[^\]]*\]|:\w+|['\"]\w+['\"])")
+_BLOCK_KEYWORD = re.compile(r"^\s*(?:if|unless|case|begin|while|until)\b")
+
+
+def _is_dev_groups(spec: str) -> bool:
+    names = set(re.findall(r"\w+", spec))
+    return bool(names) and names <= GEMFILE_DEV_GROUPS
+
+
+def _dev_lines(text: str) -> set[int]:
+    """Line numbers inside a `group … do` block made only of dev/test groups."""
+    dev: set[int] = set()
+    stack: list[bool] = []
+    for i, line in enumerate(text.splitlines()):
+        m = _GROUP_OPEN.match(line)
+        if m:
+            stack.append(_is_dev_groups(m.group(1)))
+            continue
+        if _BLOCK_KEYWORD.match(line) or re.match(r"^\s*(?:\w+.*\bdo\b(?:\s*\|.*\|)?\s*$)", line):
+            stack.append(stack[-1] if stack else False)   # nested block: same scope
+            continue
+        if re.match(r"^\s*end\b", line) and stack:
+            stack.pop()
+            continue
+        if stack and stack[-1]:
+            dev.add(i)
+    return dev
+
+
 def from_gemfile(text: str) -> list[dict]:
     """Best-effort Gemfile parser — `gem 'name', 'version'` plus
-    `gem 'name', path:/git:/github: '…'` source options."""
+    `gem 'name', path:/git:/github: '…'` source options. Gems declared only
+    in development/test groups get scope "dev"."""
     deps = []
+    dev_lines = _dev_lines(text)
     for m in _GEM_LINE.finditer(text):
         name = m.group(1)
         rest = m.group(2) or ""
@@ -51,13 +86,21 @@ def from_gemfile(text: str) -> list[dict]:
             spec = opt.group(3)
             origin = "path" if key == "path" else "git"
 
+        line_no = text.count("\n", 0, m.start())
+        inline = _INLINE_GROUP.search(rest)
+        is_dev = _is_dev_groups(inline.group(1)) if inline else line_no in dev_lines
         if origin:
             # No version requirement needed for path/git gems — the source
             # spec stands in when no version was declared.
-            deps.append({"package": name, "version": ver or spec,
-                         "version_source": "declared", "origin": origin})
+            dep = {"package": name, "version": ver or spec,
+                   "version_source": "declared", "origin": origin}
         elif name and ver:
-            deps.append({"package": name, "version": ver, "version_source": "declared"})
+            dep = {"package": name, "version": ver, "version_source": "declared"}
+        else:
+            continue
+        if is_dev:
+            dep["scope"] = "dev"
+        deps.append(dep)
     return deps
 
 
