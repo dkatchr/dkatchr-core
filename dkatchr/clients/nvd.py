@@ -4,8 +4,16 @@ NVDClient — HTTP wrapper + per-CVE file cache for the NVD 2.0 CVE API.
 Same role as osv.py (network client + cache), used by the credential-risk
 classification pass when OSV carries no usable CWE data: it fetches a single
 CVE record so we can read its CWE weaknesses. Vuln records are effectively
-immutable, so the cache is permanent per CVE — including a "not found"
-sentinel so we never re-query a CVE NVD doesn't know about.
+immutable, so the cache is permanent per CVE. A CVE NVD doesn't know about
+comes back as HTTP 200 with zero results, and that empty record is cached like
+any other.
+
+The API key goes in the `apiKey` request HEADER — NVD's documented mechanism.
+Up to 0.3.1 it was sent as an `?apiKey=` query parameter, which NVD rejects
+with HTTP 404; the client then cached a permanent "not found" sentinel, so with
+a key configured EVERY lookup silently failed. A 404 is therefore never cached
+now, and legacy {"not_found": true} sentinels are treated as cache misses and
+re-fetched (they can only have come from that bug).
 
 This module does NOT decide credential risk or parse weaknesses — it only
 returns the raw NVD JSON (or None). Classification logic lives in
@@ -68,34 +76,34 @@ class NVDClient:
     def get_cve(self, cve_id: str, max_retries: int = 4) -> dict | None:
         """Return the raw NVD 2.0 record for `cve_id`, or None.
 
-        Cache-first: a hit returns immediately with no HTTP call. A cached
-        {"not_found": true} sentinel returns None without re-querying. On a
-        live 404 we write that sentinel. Any other error logs and returns
-        None — this never raises, so a flaky NVD never aborts a scan.
+        Cache-first: a hit returns immediately with no HTTP call. A legacy
+        {"not_found": true} sentinel (written by <=0.3.1 on a rejected-key
+        404) is ignored and re-fetched. HTTP errors log and return None
+        without caching — this never raises, so a flaky NVD never aborts a
+        scan.
         """
         path = self._cve_path(cve_id)
         cached = self._read_cache(path)
-        if cached is not None:
-            if cached.get("not_found"):
-                return None
+        if cached is not None and not cached.get("not_found"):
             return cached
 
         params = {"cveId": cve_id}
-        if self.api_key:
-            params["apiKey"] = self.api_key
+        headers = {"apiKey": self.api_key} if self.api_key else {}
 
         for attempt in range(max_retries):
             self.limiter.acquire()
             try:
-                resp = requests.get(NVD_BASE_URL, params=params, timeout=30)
+                resp = requests.get(NVD_BASE_URL, params=params, headers=headers, timeout=30)
             except requests.RequestException as e:
                 wait = 2 ** attempt
                 log(f"[!] NVD GET {cve_id} network error: {e} — retrying in {wait}s")
                 time.sleep(wait)
                 continue
             if resp.status_code == 404:
-                # CVE not in NVD — cache a sentinel so we never ask again.
-                self._write_cache(path, {"not_found": True})
+                # NOT "CVE unknown" (that is a 200 with zero results) — NVD
+                # returns 404 for a rejected request, e.g. a bad API key.
+                # Never cached, so a later fix/retry can succeed.
+                log(f"[!] NVD GET {cve_id} 404 — request rejected (check NVD_API_KEY); not cached")
                 return None
             if resp.status_code == 429:
                 retry_after = resp.headers.get("Retry-After")
