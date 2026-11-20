@@ -74,6 +74,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Run Level 1 reachability analysis after vulnerability detection. "
                         "Uses GitHub Code Search API (~1s per unique vulnerable package). "
                         "Requires GITHUB_TOKEN (already required for scanning).")
+    p.add_argument("--no-transitive", action="store_true",
+                   help="Do not resolve the dependencies of lockfile-less manifests (pom.xml, "
+                        ".csproj, top-level requirements.txt) via deps.dev / the NuGet registry")
     p.add_argument("--no-dependency-graph", action="store_true",
                    help="With --reachability: skip dependency-graph (transitive) reachability and "
                         "use plain import presence only")

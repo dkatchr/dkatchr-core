@@ -66,7 +66,12 @@ def run_cli(args) -> None:
     github   = GitHubClient(rps=args.rps, burst=args.burst)
     cache    = InventoryCache(cache_dir=args.cache_dir)
     rules    = compile_rules(load_package_config(args.config))
-    scanner  = Scanner(github=github, cache=cache, package_config=rules)
+    transitive = None
+    if not getattr(args, "no_transitive", False):
+        from dkatchr.clients.transitive_resolver import TransitiveResolver
+        transitive = TransitiveResolver(cache_dir=args.cache_dir)
+    scanner  = Scanner(github=github, cache=cache, package_config=rules,
+                       transitive_resolver=transitive)
 
     # ---- resolve targets ------------------------------------------------
     repo_specs, orgs = _resolve_targets(github, args)

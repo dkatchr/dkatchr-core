@@ -64,7 +64,9 @@ ATTRIBUTION_CACHE_SCHEMA: int = 1
 #     pyproject.toml, *.deps.json), Maven poms resolved per project (parent
 #     properties + dependencyManagement), and a `scope` ("dev") on rows that a
 #     manifest marks development/test-only.
-CACHE_SCHEMA = 8
+# v9: transitive rows (version_source "transitive") for lockfile-less
+#     manifests, resolved via deps.dev / the NuGet registry.
+CACHE_SCHEMA = 9
 
 # Bundler group names that mean "not installed in production" — the
 # conventional names (`bundle config set without development test`), not a
@@ -474,6 +476,32 @@ DEPENDENCY_META_TIMEOUT = 20  # seconds per request
 # version): a published version's dependency list never changes. Bump the
 # schema to invalidate after a parsing change.
 DEPENDENCY_META_CACHE_SCHEMA = 3   # v2: (name, conditional) pairs; v3: sdist-only releases read (were cached unknown)
+# ---- Transitive resolution (manifests without a lockfile) --------------------
+# A pom.xml, .csproj or top-level requirements.txt names only DIRECT
+# dependencies; what they pull in is installed but written nowhere in the repo.
+# dkatchr/clients/transitive_resolver.py asks the registry ecosystem for each
+# direct dependency's resolved tree; dkatchr/core/transitive.py adds the
+# packages as version_source "transitive" rows. ENDPOINT config only.
+#   deps.dev (Google Open Source Insights): resolved graph for Maven/PyPI/npm.
+#     Ranges resolve to today's newest match (what a fresh install would get);
+#     Maven pins exact versions, so Maven trees are exact.
+#   NuGet: deps.dev has no NuGet graphs, so package .nuspec files (the
+#     flat-container CDN) are walked directly, taking each range's LOWEST
+#     version (NuGet's own rule).
+DEPS_DEV_DEPENDENCIES_URL = os.environ.get(
+    "DKATCHR_DEPS_DEV_DEPENDENCIES_URL",
+    "https://api.deps.dev/v3/systems/{system}/packages/{package}/versions/{version}:dependencies")
+NUGET_NUSPEC_URL = os.environ.get(
+    "DKATCHR_NUGET_NUSPEC_URL",
+    "https://api.nuget.org/v3-flatcontainer/{package}/{version}/{package}.nuspec")
+TRANSITIVE_RPS: dict[str, float] = {"deps.dev": 10.0, "NuGet": 20.0}
+TRANSITIVE_TIMEOUT = 20            # seconds per request
+TRANSITIVE_CACHE_SCHEMA = 1        # {CACHE_DIR}/transitive/, permanent per (eco, package, version)
+# Per-repo bound on direct dependencies resolved (each is one cached lookup).
+TRANSITIVE_MAX_ROOTS_PER_REPO = int(os.environ.get("DKATCHR_TRANSITIVE_MAX_ROOTS", "1500"))
+# Per-root bound on a NuGet tree walk (deps.dev returns whole trees itself).
+TRANSITIVE_NUGET_MAX_NODES = int(os.environ.get("DKATCHR_TRANSITIVE_NUGET_MAX_NODES", "400"))
+
 # Per-repo bounds. More registry lookups than this (edge-less formats only)
 # or more packages to probe for imports than this => the graph is skipped for
 # that repo and reachability falls back to plain import presence.
