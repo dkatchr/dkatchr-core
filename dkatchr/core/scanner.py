@@ -27,6 +27,7 @@ from typing import Callable
 from dkatchr.clients.github import GitHubClient
 from dkatchr.core.inventory import (
     dedupe_inventory,
+    propagate_dev_scope,
     extract_file_inventory,
     extract_maven_project_inventory,
 )
@@ -243,6 +244,11 @@ class Scanner:
                     inventory.extend(extra)
                 except Exception as e:
                     log(f"    [!] {full_name}: transitive resolution failed: {e}")
+
+            try:
+                propagate_dev_scope(inventory)
+            except Exception as e:
+                log(f"    [!] {full_name}: dev-scope propagation failed: {e}")
 
             try:
                 self.cache.write(owner, name, inventory)
