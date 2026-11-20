@@ -73,7 +73,10 @@ def from_package_json(text: str) -> list[dict]:
                 continue
             cleaned = clean_declared_version(ver)
             if cleaned:
-                deps.append({"package": name, "version": cleaned, "version_source": "declared"})
+                dep = {"package": name, "version": cleaned, "version_source": "declared"}
+                if section == "devDependencies":
+                    dep["scope"] = "dev"
+                deps.append(dep)
     return deps
 
 
@@ -141,6 +144,11 @@ def from_package_lock(text: str) -> list[dict]:
                     dep["origin"] = origin
                 if isinstance(resolved, str) and resolved:
                     dep["resolved_url"] = resolved
+                # npm marks a package installed ONLY for development "dev":
+                # true ("devOptional" = needed by both dev and optional trees,
+                # so not dev-only).
+                if meta.get("dev") is True:
+                    dep["scope"] = "dev"
                 deps.append(dep)
     else:
         # v1: flat "dependencies" dict, may have nested "dependencies" inside each entry.
@@ -157,6 +165,8 @@ def from_package_lock(text: str) -> list[dict]:
                     resolved = meta.get("resolved")
                     if isinstance(resolved, str) and resolved:
                         dep["resolved_url"] = resolved
+                    if meta.get("dev") is True:
+                        dep["scope"] = "dev"
                     deps.append(dep)
                 nested = meta.get("dependencies")
                 if isinstance(nested, dict):

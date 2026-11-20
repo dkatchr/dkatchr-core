@@ -10,6 +10,8 @@ To add a new ecosystem:
 4. Bump CACHE_SCHEMA in config.py if extractor semantics change.
 """
 
+import re
+
 from dkatchr.parsers import cargo, composer, go, maven, npm, nuget, pypi, ruby
 
 # Exact filename → (ecosystem_label, parser_fn).
@@ -32,6 +34,9 @@ EXACT_MANIFESTS: dict[str, tuple[str, callable]] = {
     "requirements.txt":   ("PyPI",       pypi.from_requirements_txt),
     "Pipfile.lock":       ("PyPI",       pypi.from_pipfile_lock),
     "poetry.lock":        ("PyPI",       pypi.from_poetry_lock),
+    "setup.py":           ("PyPI",       pypi.from_setup_py),
+    "setup.cfg":          ("PyPI",       pypi.from_setup_cfg),
+    "pyproject.toml":     ("PyPI",       pypi.from_pyproject_toml),
     # Go
     "go.mod":             ("Go",         go.from_go_mod),
     "go.sum":             ("Go",         go.from_go_sum),
@@ -47,6 +52,14 @@ SUFFIX_MANIFESTS: list[tuple[str, str, callable]] = [
     (".csproj", "NuGet", nuget.from_csproj),
     (".fsproj", "NuGet", nuget.from_csproj),
     (".vbproj", "NuGet", nuget.from_csproj),
+    (".deps.json", "NuGet", nuget.from_deps_json),
+]
+
+# Filename patterns for variants with no fixed name: requirements-dev.txt,
+# requirements_prod.txt, dev-requirements.txt, requirements.in (pip-tools input).
+PATTERN_MANIFESTS: list[tuple[re.Pattern, str, callable]] = [
+    (re.compile(r"^(?:[\w.-]+[-_.])?requirements(?:[-_.][\w.-]+)?\.(?:txt|in)$", re.IGNORECASE),
+     "PyPI", pypi.from_requirements_txt),
 ]
 
 
@@ -56,6 +69,9 @@ def manifest_handler(filename: str) -> tuple[str, callable] | None:
         return EXACT_MANIFESTS[filename]
     for suffix, eco, fn in SUFFIX_MANIFESTS:
         if filename.endswith(suffix):
+            return (eco, fn)
+    for pattern, eco, fn in PATTERN_MANIFESTS:
+        if pattern.match(filename):
             return (eco, fn)
     return None
 

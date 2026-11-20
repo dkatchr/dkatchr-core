@@ -17,7 +17,10 @@ def from_composer_json(text: str) -> list[dict]:
                 continue
             cleaned = clean_declared_version(ver)
             if cleaned:
-                deps.append({"package": name, "version": cleaned, "version_source": "declared"})
+                dep = {"package": name, "version": cleaned, "version_source": "declared"}
+                if section == "require-dev":
+                    dep["scope"] = "dev"
+                deps.append(dep)
     return deps
 
 
@@ -96,5 +99,9 @@ def from_composer_lock(text: str) -> list[dict]:
                 resolved_url = _lock_resolved_url(pkg)
                 if resolved_url:
                     dep["resolved_url"] = resolved_url
+                # packages-dev holds everything installed only for require-dev,
+                # transitive packages included.
+                if section == "packages-dev":
+                    dep["scope"] = "dev"
                 deps.append(dep)
     return deps

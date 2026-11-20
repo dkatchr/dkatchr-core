@@ -45,6 +45,9 @@ RESULT_FIELDS = [
     # anchor_files, reason} when the verdict came from the dependency graph
     # (e.g. chain ["certifi", "requests"]); empty for direct imports / no graph.
     "reachability_path",
+    # "dev" when every manifest occurrence marks the dependency development/
+    # test-only (devDependencies, packages-dev, test scope, …); empty otherwise.
+    "scope",
 ]
 
 
@@ -58,6 +61,7 @@ def empty_row(repo_full_name: str, dep: dict) -> dict:
         "version":        dep["version"],
         "version_source": dep["version_source"],
         "origin":         dep.get("origin", "registry"),
+        "scope":          dep.get("scope", ""),
         "source":         "",
         "status":         "",
         "reason":         "",

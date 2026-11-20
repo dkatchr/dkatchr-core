@@ -21,34 +21,54 @@ def extract_file_inventory(file_path: str, content: str) -> list[dict]:
     if handler is None:
         return []
     ecosystem, parser = handler
-    out = []
-    for dep in parser(content):
-        row = {
-            "file":           file_path,
-            "ecosystem":      ecosystem,
-            "package":        dep["package"],
-            "version":        dep["version"],
-            "version_source": dep["version_source"],
-            # Where the dependency resolves from. Parsers set a non-registry
-            # origin (path|git|workspace|url) only when they detect one;
-            # "registry" is materialized here so every row carries the field
-            # (the dependency-confusion pass and the CSV/DB layers read it).
-            "origin":         dep.get("origin", "registry"),
-        }
-        # The URL the lockfile records the dep as resolving from — carried
-        # only when the format records one (absent = no signal, deliberately
-        # NOT materialized: absence must never read as public or private).
-        # Consumed by the Dependency Confusion Exposure audit check.
-        if dep.get("resolved_url"):
-            row["resolved_url"] = dep["resolved_url"]
-        # Dependency edges (names this package depends on), for the
-        # dependency-graph reachability pass. Carried ONLY when the format
-        # records them: key present (even []) = edges known, key absent =
-        # unknown. Never materialize a default — [] would claim "no deps".
-        if "depends_on" in dep:
-            row["depends_on"] = list(dep["depends_on"])
-        out.append(row)
-    return out
+    return [_to_row(file_path, ecosystem, dep) for dep in parser(content)]
+
+
+def extract_maven_project_inventory(poms: dict[str, str]) -> list[dict]:
+    """Inventory rows for all of a repo's pom.xml files at once, so each pom
+    inherits properties and managed versions from its in-repo parents and
+    BOMs (see dkatchr.parsers.maven.resolve_maven_project). The per-file
+    extract_file_inventory() path stays for callers that see one pom at a time
+    (the historical walk)."""
+    from dkatchr.parsers.maven import resolve_maven_project
+    rows: list[dict] = []
+    for path, deps in resolve_maven_project(poms).items():
+        rows.extend(_to_row(path, "Maven", dep) for dep in deps)
+    return rows
+
+
+def _to_row(file_path: str, ecosystem: str, dep: dict) -> dict:
+    row = {
+        "file":           file_path,
+        "ecosystem":      ecosystem,
+        "package":        dep["package"],
+        "version":        dep["version"],
+        "version_source": dep["version_source"],
+        # Where the dependency resolves from. Parsers set a non-registry
+        # origin (path|git|workspace|url) only when they detect one;
+        # "registry" is materialized here so every row carries the field
+        # (the dependency-confusion pass and the CSV/DB layers read it).
+        "origin":         dep.get("origin", "registry"),
+    }
+    # The URL the lockfile records the dep as resolving from — carried
+    # only when the format records one (absent = no signal, deliberately
+    # NOT materialized: absence must never read as public or private).
+    # Consumed by the Dependency Confusion Exposure audit check.
+    if dep.get("resolved_url"):
+        row["resolved_url"] = dep["resolved_url"]
+    # Dependency edges (names this package depends on), for the
+    # dependency-graph reachability pass. Carried ONLY when the format
+    # records them: key present (even []) = edges known, key absent =
+    # unknown. Never materialize a default — [] would claim "no deps".
+    if "depends_on" in dep:
+        row["depends_on"] = list(dep["depends_on"])
+    # "dev" when the manifest marks the dependency development/test-only
+    # (devDependencies, packages-dev, Pipfile develop, poetry dev groups,
+    # Gemfile development/test groups, Maven test scope, test-only Gradle
+    # configurations, npm lockfile dev flags). Absent = runtime or unknown.
+    if dep.get("scope") == "dev":
+        row["scope"] = "dev"
+    return row
 
 
 def dedupe_inventory(inventory: list[dict]) -> list[dict]:
@@ -109,6 +129,10 @@ def dedupe_inventory(inventory: list[dict]) -> list[dict]:
         # 4.1.0 alongside 3.14.1 elsewhere -> 4.1.0 was never queried).
         if "resolved" in (kept.get("version_source"), other.get("version_source")):
             kept["version_source"] = "resolved"
+        # Dev-only survives a merge only when BOTH rows say so: one runtime
+        # occurrence makes the package part of the shipped product.
+        if not (kept.get("scope") == "dev" and other.get("scope") == "dev"):
+            kept.pop("scope", None)
         # OR-merge internality: if EITHER merged row carried a non-registry
         # origin, the surviving row keeps it. A dep that is path/git/workspace
         # in one manifest is internal, period — the registry-shaped duplicate

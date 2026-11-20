@@ -78,3 +78,42 @@ def from_packages_lock_json(text: str) -> list[dict]:
     for dep in deps:
         dep["depends_on"] = sorted(edges.get(dep["package"], set()))
     return deps
+
+
+def from_deps_json(text: str) -> list[dict]:
+    """*.deps.json — the .NET runtime dependency manifest written next to a
+    built assembly (and often committed). Unlike a .csproj it records the FULL
+    resolved graph, transitive packages included: `libraries` maps
+    "Name/Version" to {type: package|project|reference}, and each target's
+    entry lists that library's own `dependencies`. Only type "package" rows are
+    NuGet packages; "project" entries are in-repo projects (skipped, their own
+    .csproj is parsed) and "reference" entries are framework assemblies."""
+    try:
+        data = json.loads(text)
+    except Exception:
+        return []
+    if not isinstance(data, dict):
+        return []
+    libraries = data.get("libraries") or {}
+    edges: dict[str, set[str]] = {}
+    for target in (data.get("targets") or {}).values():
+        if not isinstance(target, dict):
+            continue
+        for key, meta in target.items():
+            if not isinstance(meta, dict) or "/" not in key:
+                continue
+            name = key.rsplit("/", 1)[0]
+            deps_map = meta.get("dependencies")
+            edges.setdefault(name, set()).update(deps_map.keys() if isinstance(deps_map, dict) else ())
+    deps = []
+    seen = set()
+    for key, meta in libraries.items():
+        if not isinstance(meta, dict) or meta.get("type") != "package" or "/" not in key:
+            continue
+        name, ver = key.rsplit("/", 1)
+        if not name or not ver or (name, ver) in seen:
+            continue
+        seen.add((name, ver))
+        deps.append({"package": name, "version": ver, "version_source": "resolved",
+                     "depends_on": sorted(edges.get(name, set()))})
+    return deps

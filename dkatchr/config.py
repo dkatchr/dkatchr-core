@@ -60,7 +60,16 @@ ATTRIBUTION_CACHE_SCHEMA: int = 1
 #     ("1.18.10-arm64-darwin" -> "1.18.10"); dedupe marks a declared row
 #     "resolved" when a lockfile pins the same version; >1 MB manifests are
 #     fetched via the Git blobs API (they were cached as empty before).
-CACHE_SCHEMA = 7
+# v8: new manifests (requirements*.txt variants, setup.py, setup.cfg,
+#     pyproject.toml, *.deps.json), Maven poms resolved per project (parent
+#     properties + dependencyManagement), and a `scope` ("dev") on rows that a
+#     manifest marks development/test-only.
+CACHE_SCHEMA = 8
+
+# Bundler group names that mean "not installed in production" — the
+# conventional names (`bundle config set without development test`), not a
+# per-package map. A gem counts as dev-only when ALL its groups are in here.
+GEMFILE_DEV_GROUPS = frozenset({"development", "test", "dev", "ci", "lint", "rubocop"})
 
 # Reachability cache (per repo + SHA) stores the matched import patterns, so a
 # change to pattern generation must invalidate it. v2: Go subpackage-import
@@ -464,7 +473,7 @@ DEPENDENCY_META_TIMEOUT = 20  # seconds per request
 # Permanent cache at {CACHE_DIR}/dependency_meta/ keyed (ecosystem, package,
 # version): a published version's dependency list never changes. Bump the
 # schema to invalidate after a parsing change.
-DEPENDENCY_META_CACHE_SCHEMA = 2   # v2: entries are (name, conditional) pairs
+DEPENDENCY_META_CACHE_SCHEMA = 3   # v2: (name, conditional) pairs; v3: sdist-only releases read (were cached unknown)
 # Per-repo bounds. More registry lookups than this (edge-less formats only)
 # or more packages to probe for imports than this => the graph is skipped for
 # that repo and reachability falls back to plain import presence.

@@ -15,7 +15,9 @@ Coverage:
     `info.requires_dist` is deliberately NOT used: it is None both for a
     package with no dependencies and for one that never published the
     metadata, so it cannot tell "none" from "unknown". A release with no wheel
-    (sdist-only) is UNKNOWN. Extra- and marker-gated requirements are KEPT:
+    (sdist-only) is read from the sdist's build-time metadata instead (PKG-INFO
+    Requires-Dist, else egg-info/requires.txt, else a PEP 643 static
+    "no dependencies") and stays UNKNOWN only when none of those decides it. Extra- and marker-gated requirements are KEPT:
     an over-approximated edge can only over-flag, never hide a path.
   * Go — the module proxy's go.mod for that module version (`require` lines,
     // indirect included).
@@ -95,6 +97,71 @@ def parse_go_mod_requires(go_mod_text: str) -> list[str]:
             if len(parts) >= 2 and parts[1].startswith("v"):
                 mods.add(parts[0])
     return sorted(mods)
+
+
+def parse_egg_requires(text: str) -> list[tuple[str, bool]]:
+    """(name, conditional) from a setuptools *.egg-info/requires.txt: lines
+    before any section are unconditional; `[extra]` / `[:marker]` sections are
+    conditional."""
+    out: set[tuple[str, bool]] = set()
+    conditional = False
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("["):
+            conditional = True
+            continue
+        m = _REQ_NAME_RE.match(line)
+        if m:
+            out.add((m.group(1), conditional))
+    return sorted(out)
+
+
+def _pep643_static_requires(pkg_info: str) -> bool:
+    """True when core metadata >= 2.2 does not mark Requires-Dist as Dynamic,
+    i.e. an absent Requires-Dist really means "no dependencies" (PEP 643)."""
+    version, dynamic = "", set()
+    for line in pkg_info.splitlines():
+        if not line.strip():
+            break                       # headers end at the first blank line
+        key, _, val = line.partition(":")
+        if key.lower() == "metadata-version":
+            version = val.strip()
+        elif key.lower() == "dynamic":
+            dynamic.add(val.strip().lower())
+    try:
+        major, minor = (int(x) for x in version.split(".")[:2])
+    except ValueError:
+        return False
+    return (major, minor) >= (2, 2) and "requires-dist" not in dynamic
+
+
+def _sdist_members(blob: bytes, url: str) -> dict[str, str]:
+    """Text of the metadata files inside an sdist (.tar.gz or .zip)."""
+    import tarfile
+    wanted = lambda n: n.endswith("/PKG-INFO") or n.endswith(".egg-info/requires.txt")
+    out: dict[str, str] = {}
+    # A TOP-LEVEL egg-info dir only ("pkg-1.0/pkg.egg-info/..."); a vendored
+    # package's egg-info deeper in the tree says nothing about this one.
+    egg = lambda n: n.count("/") >= 2 and n.split("/")[1].endswith(".egg-info")
+    if url.endswith(".zip"):
+        with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+            for n in zf.namelist():
+                if egg(n):
+                    out["__egg_info_dir__"] = ""
+                if wanted(n):
+                    out[n] = zf.read(n).decode("utf-8", "replace")
+        return out
+    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:*") as tf:
+        for m in tf.getmembers():
+            if egg(m.name):
+                out["__egg_info_dir__"] = ""
+            if m.isfile() and wanted(m.name):
+                fh = tf.extractfile(m)
+                if fh is not None:
+                    out[m.name] = fh.read().decode("utf-8", "replace")
+    return out
 
 
 class _Unknown(Exception):
@@ -203,7 +270,7 @@ class DependencyMetaClient:
         files = (resp.json() or {}).get("urls") or []
         wheels = [f for f in files if isinstance(f, dict) and f.get("packagetype") == "bdist_wheel"]
         if not wheels:
-            raise _Unknown("no wheel (sdist-only release)")
+            return self._pypi_sdist(files)
         # Prefer a pure-Python wheel (same choice the import-name resolver makes).
         wheel = next((w for w in wheels if str(w.get("filename", "")).endswith("none-any.whl")), wheels[0])
         url = wheel.get("url")
@@ -220,6 +287,42 @@ class DependencyMetaClient:
                 raise _Unknown("wheel without dist-info/METADATA")
             return parse_requires_dist(zf.read(name).decode("utf-8", "replace"))
 
+    def _pypi_sdist(self, files: list) -> list[tuple[str, bool]]:
+        """Dependencies of an sdist-only release, read from the archive's
+        build-time metadata (never by running setup.py):
+          1. PKG-INFO `Requires-Dist` lines, when present;
+          2. else <pkg>.egg-info/requires.txt (older setuptools wrote the
+             requirements there and left PKG-INFO without them);
+          3. else, with Metadata-Version >= 2.2 and Requires-Dist NOT declared
+             `Dynamic` (PEP 643), PKG-INFO is authoritative: no dependencies;
+          4. else a setuptools egg-info directory WITHOUT requires.txt: no
+             dependencies (egg_info writes that file only when there are some).
+        Anything else stays unknown."""
+        sdists = [f for f in files if isinstance(f, dict) and f.get("packagetype") == "sdist"
+                  and f.get("url")]
+        if not sdists:
+            raise _Unknown("no wheel and no sdist")
+        url = sdists[0]["url"]
+        blob = self._download(url)
+        members = _sdist_members(blob, url)
+        pkg_info = next((t for n, t in members.items() if n.count("/") == 1 and n.endswith("/PKG-INFO")), None)
+        if pkg_info:
+            deps = parse_requires_dist(pkg_info)
+            if deps:
+                return deps
+        requires = next((t for n, t in members.items()
+                         if n.endswith(".egg-info/requires.txt") and n.count("/") == 2), None)
+        if requires is not None:
+            return parse_egg_requires(requires)
+        if pkg_info and _pep643_static_requires(pkg_info):
+            return []
+        # setuptools writes <name>.egg-info/ into every sdist it builds, and
+        # requires.txt only when the project has requirements — an egg-info
+        # directory without one means "no dependencies".
+        if "__egg_info_dir__" in members:
+            return []
+        raise _Unknown("sdist metadata does not record its dependencies")
+
     def _download(self, url: str) -> bytes:
         with self._get("PyPI", url, stream=True) as resp:
             resp.raise_for_status()
@@ -227,7 +330,7 @@ class DependencyMetaClient:
             for chunk in resp.iter_content(64 * 1024):
                 buf.write(chunk)
                 if buf.tell() > _MAX_WHEEL_BYTES:
-                    raise _Unknown("wheel larger than the download guard")
+                    raise _Unknown("archive larger than the download guard")
             return buf.getvalue()
 
     def _go(self, module: str, version: str) -> list[tuple[str, bool]]:
