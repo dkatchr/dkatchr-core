@@ -62,6 +62,19 @@ def _lock_resolved_url(pkg: dict) -> str | None:
     return None
 
 
+def _lock_requires(pkg: dict) -> list[str]:
+    """`depends_on` (dependency-graph reachability): the package's `require`
+    entries that are real packages. Platform requirements (php, hhvm, ext-*,
+    lib-*, composer-*-api) are not installable packages and are dropped."""
+    out = []
+    for name in (pkg.get("require") or {}):
+        n = str(name).lower()
+        if "/" not in n:          # php, hhvm, ext-*, lib-*, composer-plugin-api …
+            continue
+        out.append(name)
+    return sorted(out)
+
+
 def from_composer_lock(text: str) -> list[dict]:
     try:
         data = json.loads(text)
@@ -75,7 +88,8 @@ def from_composer_lock(text: str) -> list[dict]:
             name = pkg.get("name")
             ver  = (pkg.get("version") or "").lstrip("v")
             if name and ver:
-                dep = {"package": name, "version": ver, "version_source": "resolved"}
+                dep = {"package": name, "version": ver, "version_source": "resolved",
+                       "depends_on": _lock_requires(pkg)}
                 origin = _lock_origin(pkg)
                 if origin:
                     dep["origin"] = origin

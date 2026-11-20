@@ -73,6 +73,9 @@ _SECTION_ORIGIN = {"GIT": "git", "PATH": "path"}
 # Indented "remote: <value>" line inside a section — the registry URL (GEM),
 # git URL (GIT) or local path (PATH) every spec in the section resolved from.
 _REMOTE_LINE = re.compile(r"^\s+remote:\s+(\S+)")
+# A spec's own dependencies: 6-space-indented `name` or `name (constraints)`
+# lines directly under its 4-space spec line.
+_LOCK_SPEC_DEP = re.compile(r"^      ([A-Za-z0-9_.\-]+)(?:\s|$)")
 
 
 def from_gemfile_lock(text: str) -> list[dict]:
@@ -88,10 +91,19 @@ def from_gemfile_lock(text: str) -> list[dict]:
     seen = set()
     section: str | None = None
     remotes: list[str] = []
+    # `depends_on` (dependency-graph reachability): Gemfile.lock lists every
+    # resolved spec's own dependencies under it, so edges are known.
+    edges: dict[str, set[str]] = {}
+    current: str | None = None
     for line in text.splitlines():
         if line and not line[0].isspace():
             section = line.strip()
             remotes = []
+            current = None
+            continue
+        dm = _LOCK_SPEC_DEP.match(line)
+        if dm and current is not None:
+            edges[current].add(dm.group(1))
             continue
         rm = _REMOTE_LINE.match(line)
         if rm:
@@ -102,6 +114,8 @@ def from_gemfile_lock(text: str) -> list[dict]:
             continue
         name = m.group(1)
         ver  = m.group(2).strip()
+        current = name
+        edges.setdefault(name, set())
         # Skip platform/range qualifiers like "= 7.0.0" — they contain spaces
         if " " in ver:
             continue
@@ -116,4 +130,6 @@ def from_gemfile_lock(text: str) -> list[dict]:
         if len(remotes) == 1:
             dep["resolved_url"] = remotes[0]
         deps.append(dep)
+    for dep in deps:
+        dep["depends_on"] = sorted(edges.get(dep["package"], set()))
     return deps

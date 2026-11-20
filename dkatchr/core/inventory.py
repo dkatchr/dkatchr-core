@@ -41,6 +41,12 @@ def extract_file_inventory(file_path: str, content: str) -> list[dict]:
         # Consumed by the Dependency Confusion Exposure audit check.
         if dep.get("resolved_url"):
             row["resolved_url"] = dep["resolved_url"]
+        # Dependency edges (names this package depends on), for the
+        # dependency-graph reachability pass. Carried ONLY when the format
+        # records them: key present (even []) = edges known, key absent =
+        # unknown. Never materialize a default — [] would claim "no deps".
+        if "depends_on" in dep:
+            row["depends_on"] = list(dep["depends_on"])
         out.append(row)
     return out
 
@@ -101,4 +107,9 @@ def dedupe_inventory(inventory: list[dict]) -> list[dict]:
         if (kept.get("origin", "registry") == "registry"
                 and other.get("origin", "registry") != "registry"):
             kept["origin"] = other["origin"]
+        # Edges: a lockfile row knows them, a manifest row doesn't. The same
+        # (eco, package, version) has the same dependencies wherever it is
+        # recorded, so known-from-either wins and both edge lists union.
+        if "depends_on" in other:
+            kept["depends_on"] = sorted(set(kept.get("depends_on", [])) | set(other["depends_on"]))
     return [best[k] for k in order]

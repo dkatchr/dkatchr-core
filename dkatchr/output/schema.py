@@ -41,6 +41,10 @@ RESULT_FIELDS = [
     # rows (registry|path|git|workspace|url); `suspicion_signals` is the
     # finding's JSON signal blob, empty for non-CONFUSION rows.
     "origin", "suspicion_signals",
+    # Dependency-graph reachability (additive): JSON {method, verdict, chain,
+    # anchor_files, reason} when the verdict came from the dependency graph
+    # (e.g. chain ["certifi", "requests"]); empty for direct imports / no graph.
+    "reachability_path",
 ]
 
 
@@ -80,4 +84,5 @@ def empty_row(repo_full_name: str, dep: dict) -> dict:
         "introduced_by_message": "",
         "introduced_by_is_bot":  "",
         "suspicion_signals":     "",
+        "reachability_path":     "",
     }

@@ -32,6 +32,9 @@ from dkatchr.core.attribution import enrich_attribution
 from dkatchr.core.confusion import detect_confusion, load_internal_patterns
 from dkatchr.core.typosquat import detect_typosquats
 from dkatchr.core.osv_enrichment import osv_enrich, osv_rows_for_repo
+from dkatchr.clients.dependency_meta import DependencyMetaClient
+from dkatchr.config import GRAPH_MAX_META_LOOKUPS
+from dkatchr.core.dependency_graph import build_dependency_graph
 from dkatchr.core.reachability import enrich_reachability
 from dkatchr.core.rules import compile_rules, load_package_config
 from dkatchr.core.scanner import Scanner
@@ -218,6 +221,8 @@ def run_cli(args) -> None:
             log(f"\n===== REACHABILITY ANALYSIS =====")
             all_repos = set(per_repo_rule_rows) | set(per_repo_osv_rows)
             reach_cache = ReachabilityCache(cache_dir=args.cache_dir)
+            use_graph = not getattr(args, "no_dependency_graph", False)
+            dep_meta = DependencyMetaClient(cache_dir=args.cache_dir) if use_graph else None
             reach_totals: dict[str, int] = {
                 "REACHABLE": 0, "UNUSED": 0, "UNKNOWN": 0, "packages": 0,
             }
@@ -286,17 +291,47 @@ def run_cli(args) -> None:
                         log(f"[{_repo}] resolution FAILED "
                             f"{payload.get('ecosystem','')}/{payload.get('package','')}: "
                             f"{payload.get('reason','')}")
+                    elif phase == "graph_probe":
+                        log(f"[{_repo}] dependency graph: checking imports of "
+                            f"{payload.get('probe_packages', 0)} package(s) that could load "
+                            f"a vulnerable one")
+                    elif phase == "graph_skipped":
+                        log(f"[{_repo}] dependency graph skipped: "
+                            f"{payload.get('probe_packages', 0)} packages to probe "
+                            f"> limit {payload.get('limit')}")
+                    elif phase == "graph_regrep":
+                        log(f"[{_repo}] cached scan didn't cover the dependency graph — re-scanning")
                     elif phase == "resolving_done":
                         log(f"[{_repo}] import name resolution: "
                             f"{payload.get('resolved',0)} resolved, "
                             f"{payload.get('cached',0)} cached, "
                             f"{payload.get('failed',0)} failed")
 
+                graph = None
+                if use_graph:
+                    try:
+                        def _graph_progress(p: dict, _repo=full_name) -> None:
+                            log(f"[{_repo}] dependency metadata {p.get('current')}/{p.get('total')}")
+                        graph = build_dependency_graph(
+                            per_repo_inventory.get(full_name) or [], dep_meta.get_dependencies,
+                            dep_meta.SUPPORTED_ECOSYSTEMS, GRAPH_MAX_META_LOOKUPS,
+                            on_progress=_graph_progress)
+                        log(f"[{full_name}] dependency graph: {len(graph.edges)} package(s), "
+                            f"{len(graph.known)} with known dependencies"
+                            + (" (lookup budget hit — partial)" if graph.truncated else ""))
+                    except Exception as e:  # graph failure = plain import presence
+                        log(f"[!] [{full_name}] dependency graph failed: {e}")
+                        graph = None
+
                 enrich_reachability(
                     all_rows, full_name, sha, github, reach_cache,
                     on_progress=_cli_reach_progress,
                     cache_dir=args.cache_dir,
+                    dependency_graph=graph,
                 )
+                for row in all_rows:
+                    if isinstance(row.get("reachability_path"), dict):
+                        row["reachability_path"] = json.dumps(row["reachability_path"])
 
                 seen_pkgs: set[tuple[str, str]] = set()
                 for row in all_rows:
@@ -793,9 +828,9 @@ def _scan_batch(
             else:
                 writer.write_rows(rows)
 
-            # Inventory feeds the OSV pass, the confusion pass AND the typosquat
-            # pass — collect it when any is active.
-            if args.osv or not args.no_confusion or args.typosquat:
+            # Inventory feeds the OSV pass, the confusion pass, the typosquat
+            # pass AND the dependency graph — collect it when any is active.
+            if args.osv or not args.no_confusion or args.typosquat or args.reachability:
                 with inventory_lock:
                     per_repo_inventory[full_name] = result["inventory"]
 

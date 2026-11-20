@@ -74,6 +74,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Run Level 1 reachability analysis after vulnerability detection. "
                         "Uses GitHub Code Search API (~1s per unique vulnerable package). "
                         "Requires GITHUB_TOKEN (already required for scanning).")
+    p.add_argument("--no-dependency-graph", action="store_true",
+                   help="With --reachability: skip dependency-graph (transitive) reachability and "
+                        "use plain import presence only")
     p.add_argument("--attribution",    action="store_true",
                    help="Attribute each finding to the commit author who last touched that "
                         "package's manifest line ('Introduced By'). One git-blame call per "
