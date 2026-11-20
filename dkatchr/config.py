@@ -76,7 +76,7 @@ GEMFILE_DEV_GROUPS = frozenset({"development", "test", "dev", "ci", "lint", "rub
 # Reachability cache (per repo + SHA) stores the matched import patterns, so a
 # change to pattern generation must invalidate it. v2: Go subpackage-import
 # patterns ('"module/').
-REACHABILITY_CACHE_SCHEMA = 2
+REACHABILITY_CACHE_SCHEMA = 3   # v3: executed-program (command) patterns
 
 # Cache directory — anchored to CWD by default. Override via --cache-dir.
 # Lives under data/cache to match the web layer (web/settings.py CACHE_DIR) and
@@ -394,6 +394,27 @@ REACHABILITY_SNIPPET_MAX_CHARS: int = 500
 # Inclusive by design: extension match is a cheap pre-filter, then per-file
 # AC scan does the real work. A false positive costs one wasted scan of a
 # template; a false negative lets a vulnerable import slip past silently.
+# ---- Executed programs ("command" reachability) ----------------------------
+# A package can be used by RUNNING its program rather than importing it
+# (`subprocess.run(["ocrmypdf", ...])`, `RUN celery worker` in a Dockerfile,
+# `web: gunicorn app:app` in a Procfile). Its command names come from the
+# package itself (PyPI console/gui scripts, gem executables — read by the
+# import-name resolvers). Where invocations are searched:
+#   * quoted forms ("ocrmypdf", 'ocrmypdf ') in source files and in these
+#     command files;
+#   * bare forms (` ocrmypdf `, line-start `ocrmypdf `) ONLY in these command
+#     files — in source code a bare word is usually prose.
+# Manifests never count (a dependency declaration is not an invocation).
+REACHABILITY_COMMAND_FILE_NAMES: frozenset[str] = frozenset({
+    "Dockerfile", "Containerfile", "Procfile", "Makefile", "Jenkinsfile", "Rakefile",
+})
+REACHABILITY_COMMAND_FILE_PREFIXES: tuple[str, ...] = ("Dockerfile.", "Procfile.")
+REACHABILITY_COMMAND_FILE_SUFFIXES: tuple[str, ...] = (
+    ".sh", ".bash", ".zsh", ".dockerfile", ".mk", ".yml", ".yaml", ".service", ".cfg", ".ini", ".toml",
+)
+# Shorter command names (`tox`, `pip`) collide with ordinary words too often.
+REACHABILITY_COMMAND_MIN_LEN = 4
+
 REACHABILITY_SOURCE_EXTENSIONS: frozenset[str] = frozenset({
     # Python (PyPI)
     ".py", ".pyx", ".pxd", ".pyi", ".pyw",
@@ -431,7 +452,7 @@ REACHABILITY_SOURCE_EXTENSIONS: frozenset[str] = frozenset({
 # {CACHE_DIR}/registry/{ecosystem}__{package}.json keyed on (eco, pkg) only —
 # import names are version-stable in practice.
 REGISTRY_RESOLVER_WORKERS:      int = int(os.environ.get("DKATCHR_REGISTRY_RESOLVER_WORKERS", "6"))
-REGISTRY_RESOLVER_CACHE_SCHEMA: int = 1
+REGISTRY_RESOLVER_CACHE_SCHEMA: int = 2   # v2: entries carry "commands" (installed programs)
 
 # File path substrings (case-insensitive) that indicate a test file.
 # Conservative: only patterns whose presence in a path is a strong signal

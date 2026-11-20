@@ -85,8 +85,28 @@ def _pick_sdist(urls: list[dict]) -> dict | None:
     return None
 
 
-def _from_wheel(blob: bytes, package: str) -> tuple[list[str], str] | None:
-    """Wheel → top_level.txt (primary), or directory structure (fallback)."""
+def console_scripts(entry_points_text: str) -> list[str]:
+    """Command names from an entry_points.txt: the keys of its
+    [console_scripts] and [gui_scripts] sections — the programs pip installs."""
+    out: list[str] = []
+    section = ""
+    for raw in entry_points_text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        if line.startswith("["):
+            section = line.strip("[]").strip().lower()
+            continue
+        if section in ("console_scripts", "gui_scripts") and "=" in line:
+            name = line.split("=", 1)[0].strip()
+            if name and name not in out:
+                out.append(name)
+    return sorted(out)
+
+
+def _from_wheel(blob: bytes, package: str) -> tuple[list[str], str, list[str]] | None:
+    """Wheel → top_level.txt (primary), or directory structure (fallback).
+    Third element: the wheel's console/gui script command names."""
     try:
         zf = zipfile.ZipFile(io.BytesIO(blob))
     except zipfile.BadZipFile as e:
@@ -95,6 +115,14 @@ def _from_wheel(blob: bytes, package: str) -> tuple[list[str], str] | None:
 
     with zf:
         names = zf.namelist()
+        commands: list[str] = []
+        for entry in names:
+            if entry.endswith(".dist-info/entry_points.txt"):
+                try:
+                    commands = console_scripts(zf.read(entry).decode("utf-8", errors="ignore"))
+                except KeyError:
+                    pass
+                break
 
         # Primary: dist-info/top_level.txt
         for entry in names:
@@ -109,7 +137,7 @@ def _from_wheel(blob: bytes, package: str) -> tuple[list[str], str] | None:
                     if line.strip()
                 ]
                 if imports:
-                    return imports, "wheel_top_level"
+                    return imports, "wheel_top_level", commands
 
         # Fallback: top-level directories that are not dist-info / data.
         tops: set[str] = set()
@@ -130,7 +158,7 @@ def _from_wheel(blob: bytes, package: str) -> tuple[list[str], str] | None:
                 tops.add(first)
 
         if tops:
-            return sorted(tops), "wheel_directory_structure"
+            return sorted(tops), "wheel_directory_structure", commands
 
     return None
 
