@@ -186,19 +186,45 @@ class GitHubClient:
         data = self.get(url, {"recursive": "1"}).json()
         return data.get("tree", [])
 
+    def _fetch_blob(self, owner: str, repo: str, blob_sha: str) -> str:
+        """Text of a git blob via the Git Data API (files up to 100 MB)."""
+        url  = f"{self.api_base}/repos/{owner}/{repo}/git/blobs/{blob_sha}"
+        data = self.get(url).json()
+        content = data.get("content", "")
+        if data.get("encoding", "base64") == "base64":
+            return base64.b64decode(content).decode("utf-8", errors="replace")
+        return content
+
+    def _decode_contents(self, owner: str, repo: str, path: str, data: dict) -> str:
+        """Decode a contents-API file response.
+
+        Above 1 MB the contents API returns `encoding: "none"` and an empty
+        `content` (the file is too large to inline), so a large lockfile used
+        to parse as zero rows. Fall back to the blob by its SHA in that case.
+        """
+        content  = data.get("content", "")
+        encoding = data.get("encoding", "base64")
+        if encoding == "base64" and (content or not data.get("size")):
+            return base64.b64decode(content).decode("utf-8", errors="replace")
+        if encoding == "none" or (not content and data.get("size")):
+            blob_sha = data.get("sha")
+            if not blob_sha:
+                raise ValueError(f"{owner}/{repo}:{path} is too large for the "
+                                 f"contents API and has no blob sha")
+            log(f"    {path}: {data.get('size', '?')} bytes, fetching via the blobs API")
+            return self._fetch_blob(owner, repo, blob_sha)
+        return content
+
     def fetch_file(self, owner: str, repo: str, path: str, ref: str) -> str:
         url  = f"{self.api_base}/repos/{owner}/{repo}/contents/{quote(path, safe='/')}"
         data = self.get(url, {"ref": ref}).json()
         if isinstance(data, list):
             return ""
-        content  = data.get("content", "")
-        encoding = data.get("encoding", "base64")
-        if encoding == "base64":
-            try:
-                return base64.b64decode(content).decode("utf-8", errors="replace")
-            except Exception:
-                return ""
-        return content
+        try:
+            return self._decode_contents(owner, repo, path, data)
+        except Exception as e:
+            log(f"[!] fetch_file({owner}/{repo}:{path}) failed: {e}")
+            return ""
 
     # ---- attribution helpers -------------------------------------------
 
@@ -216,11 +242,7 @@ class GitHubClient:
         data = self.get(url, {"ref": ref}).json()  # self.get → limiter.acquire() + raise_for_status
         if isinstance(data, list):
             raise ValueError(f"{owner}/{repo}:{path} is a directory, not a file")
-        content  = data.get("content", "")
-        encoding = data.get("encoding", "base64")
-        if encoding == "base64":
-            return base64.b64decode(content).decode("utf-8", errors="replace")
-        return content
+        return self._decode_contents(owner, repo, path, data)
 
     def get_file_blame(self, owner: str, repo: str, path: str, ref: str) -> list[dict]:
         """Git blame for a single file at `ref`, via the GraphQL v4 API.
