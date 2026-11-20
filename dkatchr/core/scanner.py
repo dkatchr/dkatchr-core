@@ -57,6 +57,52 @@ class Scanner:
         # dependencies of lockfile-less manifests pull in. None = off.
         self.transitive     = transitive_resolver
 
+    def _manifests_from_tarball(self, repo: dict, sha: str, manifest_blobs: list[dict],
+                                on_progress: ProgressCb) -> dict[str, str]:
+        """{path: text} for the manifests, read from ONE repo tarball when the
+        repo has at least SCAN_TARBALL_MIN_MANIFESTS of them and is under
+        SCAN_TARBALL_MAX_REPO_KB; {} otherwise or on any failure (the caller
+        then fetches per file). Streamed: only manifest members are read."""
+        import tarfile
+
+        from dkatchr.config import (
+            SCAN_TARBALL_MAX_MANIFEST_BYTES,
+            SCAN_TARBALL_MAX_REPO_KB,
+            SCAN_TARBALL_MIN_MANIFESTS,
+        )
+        full_name = repo["full_name"]
+        size_kb = repo.get("size")
+        if (len(manifest_blobs) < SCAN_TARBALL_MIN_MANIFESTS
+                or not isinstance(size_kb, int) or size_kb > SCAN_TARBALL_MAX_REPO_KB):
+            return {}
+        wanted = {n.get("path", "") for n in manifest_blobs}
+        if on_progress:
+            on_progress({"phase": "manifests_tarball", "full_name": full_name,
+                         "total": len(wanted), "repo_kb": size_kb})
+        out: dict[str, str] = {}
+        try:
+            stream, reason = self.github.open_repo_tarball_stream(full_name, ref=sha)
+            if stream is None:
+                log(f"    [!] {full_name}: manifest tarball unavailable ({reason}); fetching per file")
+                return {}
+            with stream, tarfile.open(fileobj=stream, mode="r|gz") as tar:
+                for member in tar:
+                    if not member.isfile():
+                        continue
+                    # Members are "<owner>-<repo>-<sha>/<path>".
+                    path = member.name.split("/", 1)[1] if "/" in member.name else ""
+                    if path not in wanted or member.size > SCAN_TARBALL_MAX_MANIFEST_BYTES:
+                        continue
+                    fh = tar.extractfile(member)
+                    if fh is not None:
+                        out[path] = fh.read().decode("utf-8", errors="replace")
+                    if len(out) == len(wanted):
+                        break
+        except Exception as e:
+            log(f"    [!] {full_name}: manifest tarball failed ({e}); fetching the rest per file")
+        repo_log(f"    {full_name}: {len(out)}/{len(wanted)} manifests from the tarball")
+        return out
+
     def scan_repo(self, repo: dict, prefix: str, full_rescan: bool,
                    on_progress: ProgressCb = None) -> dict:
         """
@@ -144,10 +190,14 @@ class Scanner:
             # versions usually live in its parent pom's <properties> /
             # <dependencyManagement>, which a per-file parse can't see.
             poms: dict[str, str] = {}
+            # Monorepos: one tarball instead of hundreds of contents-API calls.
+            prefetched = self._manifests_from_tarball(repo, sha, manifest_blobs, on_progress)
             for i, node in enumerate(manifest_blobs, 1):
                 path = node.get("path", "")
                 try:
-                    content = self.github.fetch_file(owner, name, path, branch)
+                    content = prefetched.get(path)
+                    if content is None:
+                        content = self.github.fetch_file(owner, name, path, branch)
                 except Exception as e:
                     log(f"    [!] {full_name}: could not fetch {path}: {e}")
                     if on_progress and (i % 5 == 0 or i == total_manifests):
