@@ -41,7 +41,9 @@ SHAs accumulate on disk — that's intentional for now; a sweep job is future wo
 
 Old cache files written before `matched_patterns` existed will fail the
 shape check in `read()` and be silently treated as misses (the next scan
-rebuilds them in the current shape). No versioning required.
+rebuilds them in the current shape). Entries also carry `schema`
+(config.REACHABILITY_CACHE_SCHEMA): pattern-generation changes bump it, since a
+stored match map can't answer a pattern that didn't exist when it was written.
 """
 
 import json
@@ -49,6 +51,7 @@ import os
 import re
 from datetime import datetime, timezone
 
+from dkatchr.config import REACHABILITY_CACHE_SCHEMA
 from dkatchr.logger import log
 
 
@@ -76,6 +79,8 @@ class ReachabilityCache:
             return None, None
         if not isinstance(data, dict):
             return None, None
+        if data.get("schema") != REACHABILITY_CACHE_SCHEMA:
+            return None, None
         results = data.get("results")
         matched_patterns = data.get("matched_patterns")
         if not isinstance(results, dict) or not isinstance(matched_patterns, dict):
@@ -93,6 +98,7 @@ class ReachabilityCache:
         """Write results + matched_patterns to cache. Silently swallow any write errors."""
         path = self._path(repo_full_name, sha)
         payload = {
+            "schema":           REACHABILITY_CACHE_SCHEMA,
             "repo":             repo_full_name,
             "sha":              sha,
             "cached_at":        datetime.now(timezone.utc).isoformat(),

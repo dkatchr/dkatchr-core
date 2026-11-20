@@ -56,7 +56,16 @@ ATTRIBUTION_CACHE_SCHEMA: int = 1
 #     dependency-graph reachability; ALSO fixes pnpm v5/v6 lockfiles, whose
 #     2-space-indented keys never matched (they parsed to zero rows), keys with
 #     a peer suffix "(debug@4.3.4)", and truncated git-URL versions.
-CACHE_SCHEMA = 6
+# v7: Gemfile.lock platform suffixes stripped from versions
+#     ("1.18.10-arm64-darwin" -> "1.18.10"); dedupe marks a declared row
+#     "resolved" when a lockfile pins the same version; >1 MB manifests are
+#     fetched via the Git blobs API (they were cached as empty before).
+CACHE_SCHEMA = 7
+
+# Reachability cache (per repo + SHA) stores the matched import patterns, so a
+# change to pattern generation must invalidate it. v2: Go subpackage-import
+# patterns ('"module/').
+REACHABILITY_CACHE_SCHEMA = 2
 
 # Cache directory — anchored to CWD by default. Override via --cache-dir.
 # Lives under data/cache to match the web layer (web/settings.py CACHE_DIR) and
@@ -156,7 +165,9 @@ NVD_USELESS_CWES = frozenset({"NVD-CWE-noinfo", "NVD-CWE-Other"})
 MALWARE_SUMMARY_MARKERS = frozenset({
     "malware in ",
     "malicious code in ",
-    "malicious package",
+    # "Malicious Package in <pkg>" (older npm advisories). The trailing " in "
+    # keeps titles like "... Malicious Package Injection" (nltk) out.
+    "malicious package in ",
 })
 
 # ---- Historical Exposure (supply-chain forensics) --------------------------

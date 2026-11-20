@@ -70,7 +70,9 @@ def dedupe_inventory(inventory: list[dict]) -> list[dict]:
     file, so the "Introduced By" git-blame attributes to whoever ADDED the
     dependency, not whoever last regenerated the lockfile's checksums (go.sum
     churns on every `go mod tidy`/build and is often rewritten by a tidy/bot
-    commit). OSV/reachability are unaffected — the version is the same either way.
+    commit). The surviving row is marked version_source "resolved" — a lockfile
+    pinned that exact version, and osv_enrich only trusts resolved rows when the
+    package has other resolved versions in the repo.
 
     npm / RubyGems are unaffected: their declared entry is a semver RANGE, so its
     version differs from the resolved pin → the two are NOT collapsed (and the
@@ -100,6 +102,13 @@ def dedupe_inventory(inventory: list[dict]) -> list[dict]:
             kept, other = dep, existing
         else:
             kept, other = existing, dep
+        # A lockfile pinned this exact version, so it IS resolved, even when
+        # the declared row (kept above for blame) is the one that survives.
+        # Leaving it "declared" made osv_enrich skip the version whenever the
+        # package had other resolved versions in the repo (^4.1.0 + a lockfile
+        # 4.1.0 alongside 3.14.1 elsewhere -> 4.1.0 was never queried).
+        if "resolved" in (kept.get("version_source"), other.get("version_source")):
+            kept["version_source"] = "resolved"
         # OR-merge internality: if EITHER merged row carried a non-registry
         # origin, the surviving row keeps it. A dep that is path/git/workspace
         # in one manifest is internal, period — the registry-shaped duplicate

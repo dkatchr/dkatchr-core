@@ -187,6 +187,10 @@ def _build_patterns(import_names: list[str], ecosystem: str) -> list[str]:
             if not n:
                 continue
             patterns.append(f'"{n}"')
+            # Subpackage imports: `"k8s.io/client-go/kubernetes"` uses the
+            # `k8s.io/client-go` module. The trailing slash keeps
+            # `"k8s.io/client-gofoo"` from matching.
+            patterns.append(f'"{n}/')
             for suffix in ("/v2", "/v3", "/v4", "/v5"):
                 if n.endswith(suffix):
                     patterns.append(f'"{n[:-len(suffix)]}"')

@@ -76,6 +76,21 @@ _REMOTE_LINE = re.compile(r"^\s+remote:\s+(\S+)")
 # A spec's own dependencies: 6-space-indented `name` or `name (constraints)`
 # lines directly under its 4-space spec line.
 _LOCK_SPEC_DEP = re.compile(r"^      ([A-Za-z0-9_.\-]+)(?:\s|$)")
+# Platform-specific gems are locked as "<version>-<platform>"
+# ("1.18.10-arm64-darwin", "1.16.0-java", "2.6.0-x64-mingw-ucrt"). Advisories
+# are keyed on the bare version, so the platform must be stripped or the gem
+# matches nothing. The pattern follows Gem::Platform's cpu/os grammar; a
+# hyphenated prerelease ("1.0.0-rc1") does not match it and is left alone.
+_PLATFORM_SUFFIX = re.compile(
+    r"^(?P<ver>[0-9][^-]*)-(?:java|jruby|dalvik\w*|mswin\w*|mingw\w*|"
+    r"(?:x86_64|x86|x64|i[3-6]86|arm\w*|aarch64|universal|powerpc\w*|ppc\w*|"
+    r"s390x?|sparc\w*|wasm\w*|riscv\w*|loongarch\w*)(?:-[A-Za-z0-9_.]+)*)$"
+)
+
+
+def _strip_platform(ver: str) -> str:
+    m = _PLATFORM_SUFFIX.match(ver)
+    return m.group("ver") if m else ver
 
 
 def from_gemfile_lock(text: str) -> list[dict]:
@@ -119,6 +134,8 @@ def from_gemfile_lock(text: str) -> list[dict]:
         # Skip platform/range qualifiers like "= 7.0.0" — they contain spaces
         if " " in ver:
             continue
+        # One gem locked for several platforms collapses to one row here.
+        ver = _strip_platform(ver)
         key = (name, ver)
         if key in seen:
             continue
