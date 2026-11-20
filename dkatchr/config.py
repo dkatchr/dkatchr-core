@@ -52,7 +52,11 @@ ATTRIBUTION_CACHE_SCHEMA: int = 1
 #     ('@scope/pkg@1.0.0':) because '@' is a reserved indicator, and the v9
 #     regex now strips the quote — every scoped dep in a pnpm v9 lockfile was
 #     previously dropped from inventory (live scan AND historical walk).
-CACHE_SCHEMA = 5
+# v6: lockfile parsers attach `depends_on` (dependency edges) for
+#     dependency-graph reachability; ALSO fixes pnpm v5/v6 lockfiles, whose
+#     2-space-indented keys never matched (they parsed to zero rows), keys with
+#     a peer suffix "(debug@4.3.4)", and truncated git-URL versions.
+CACHE_SCHEMA = 6
 
 # Cache directory — anchored to CWD by default. Override via --cache-dir.
 # Lives under data/cache to match the web layer (web/settings.py CACHE_DIR) and
@@ -426,3 +430,32 @@ REACHABILITY_TEST_FILE_PATTERNS: tuple[str, ...] = (
     ".test.", ".spec.",   # JS/TS: foo.test.ts, foo.spec.ts
     "conftest",           # pytest conftest.py / shared fixtures
 )
+
+# ---- Dependency-graph reachability ------------------------------------------
+# A vulnerable package that your code never imports can still be loaded by a
+# package that IS imported (certifi via requests). The graph comes from
+# lockfile edges (`depends_on` on inventory rows) and, for formats that record
+# none (requirements.txt, Pipfile.lock, go.mod/go.sum), from registry metadata
+# via dkatchr/clients/dependency_meta.py. Pure propagation lives in
+# dkatchr/core/dependency_graph.py.
+#
+# Registry endpoints for package-version dependency metadata (ENDPOINT config,
+# not package knowledge). PyPI: the release JSON lists the version's files; a
+# wheel's core metadata is served on its own at "<wheel-url>.metadata" (PEP 658)
+# — a few KB instead of downloading the wheel. Go: the module proxy serves each
+# module version's go.mod; uppercase path letters are escaped as "!" + lower.
+PYPI_RELEASE_JSON_URL = "https://pypi.org/pypi/{package}/{version}/json"
+PYPI_PROJECT_JSON_URL = "https://pypi.org/pypi/{package}/json"   # current version (info.version)
+GO_PROXY_MOD_URL      = os.environ.get("GOPROXY_MOD_URL", "https://proxy.golang.org/{module}/@v/{version}.mod")
+GO_PROXY_LATEST_URL   = os.environ.get("GOPROXY_LATEST_URL", "https://proxy.golang.org/{module}/@latest")
+DEPENDENCY_META_RPS: dict[str, float] = {"PyPI": 8.0, "Go": 8.0}
+DEPENDENCY_META_TIMEOUT = 20  # seconds per request
+# Permanent cache at {CACHE_DIR}/dependency_meta/ keyed (ecosystem, package,
+# version): a published version's dependency list never changes. Bump the
+# schema to invalidate after a parsing change.
+DEPENDENCY_META_CACHE_SCHEMA = 2   # v2: entries are (name, conditional) pairs
+# Per-repo bounds. More registry lookups than this (edge-less formats only)
+# or more packages to probe for imports than this => the graph is skipped for
+# that repo and reachability falls back to plain import presence.
+GRAPH_MAX_META_LOOKUPS   = int(os.environ.get("DKATCHR_GRAPH_MAX_META_LOOKUPS", "800"))
+GRAPH_MAX_PROBE_PACKAGES = int(os.environ.get("DKATCHR_GRAPH_MAX_PROBE_PACKAGES", "600"))

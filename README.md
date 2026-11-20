@@ -38,6 +38,7 @@ Most free SCA tools stop at "does this version have a CVE." dKatchr adds the lay
 - **Dependency confusion detection** - flags internal-looking package names (path/git/workspace dependencies, declared internal namespace patterns, or cross-repo mismatches) that also resolve on a public registry. On by default.
 - **Typosquatting detection** - Damerau-Levenshtein distance against per-ecosystem top-package lists, gated by a mandatory registry-metadata check (recent creation / low downloads) to suppress false positives. Opt-in (fetches large feed data).
 - **Level 1 reachability** - Aho-Corasick grep across a streamed repo tarball for import statements and ecosystem-idiomatic usage patterns (e.g. Bundler autoload conventions, `Rails::`, `JSON.parse`), so you know a flagged package is actually imported somewhere.
+- **Dependency-graph (transitive) reachability** - a vulnerable package your code never imports can still be loaded by one it does (`certifi` via `requests`). With `--reachability`, dKatchr builds each repo's dependency graph from lockfile edges (poetry.lock, Cargo.lock, package-lock.json, yarn.lock, pnpm-lock.yaml, Gemfile.lock, composer.lock, packages.lock.json) and, for formats with no edges (requirements.txt incl. `pip freeze` output, Pipfile.lock, go.mod/go.sum), from registry metadata (PyPI wheel METADATA via PEP 658, the Go module proxy). A finding is REACHABLE when an imported package reaches it (the shortest chain lands in the `reachability_path` CSV column, e.g. `certifi <- requests`), UNUSED only when the graph *proves* nothing imported can load it, and UNKNOWN when edges or import checks are missing. Disable with `--no-dependency-graph`.
 - **Commit attribution ("Introduced By")** - one git-blame call per unique manifest file (GraphQL, cached by branch SHA) resolves each finding to the commit and author that introduced it.
 - **SHA-keyed caching everywhere** - inventory, reachability, and attribution are all cached per repo branch SHA, so re-scanning an unchanged branch costs nothing.
 - **Progress streaming** - every long-running phase (tarball download, per-repo scanning, confusion/typosquat lookups) reports structured progress, not silence.
@@ -183,6 +184,10 @@ rm -rf data/cache/osv data/cache/kev data/cache/epss
 
 # Force a fresh registry check for confusion/typosquat candidates
 rm -rf data/cache/registry_meta/
+
+# Force fresh dependency metadata for the dependency graph (permanent per
+# package version - published metadata never changes)
+rm -rf data/cache/dependency_meta/
 ```
 
 ## Architecture
@@ -204,8 +209,9 @@ dkatchr/
 
 ## Known limitations
 
-- No formal automated test suite yet (contributions welcome - `dkatchr/core/` and `dkatchr/parsers/` are pure functions with no I/O, the natural place to start).
-- Reachability is import-presence + usage-pattern detection, not full call-graph analysis - it won't catch reflection-based or dynamically-constructed import paths.
+- The test suite (`tests/`, run with `PYTHONPATH=. pytest tests`) covers the dependency graph, parser edges, the dependency-metadata and NVD clients; most of `dkatchr/core/` and `dkatchr/parsers/` still has none (contributions welcome - they are pure functions with no I/O).
+- Reachability is import-presence + usage-pattern detection, not full call-graph analysis - it won't catch reflection-based or dynamically-constructed import paths. The dependency graph inherits this: a package loaded by NAME rather than imported (Django `INSTALLED_APPS` strings, pytest plugins, gunicorn worker classes, tools run from npm scripts) is invisible, so what it loads can be missed.
+- Dependency graph: Maven/Gradle are not covered (transitive resolution needs parent POMs and version mediation) - their findings keep plain import presence. sdist-only PyPI releases and private Go modules have unknown edges, and a private git/url dependency's import names can't be resolved from a registry - verdicts touching either become UNKNOWN, never UNUSED. Rust build-dependencies / proc-macros are treated as runtime edges. The graph is name-level (all versions of a package share a node) and keeps optional/extra edges - both over-approximate, never hide a path.
 - Typosquat/confusion registry checks cover npm, PyPI, crates.io, RubyGems, and Packagist. Go, Maven, and NuGet aren't covered yet (different naming/ownership models per ecosystem).
 - PyPI download counts are unavailable upstream (the JSON API's count field is deprecated), so the typosquat metadata gate falls back to creation-date-only on PyPI.
 

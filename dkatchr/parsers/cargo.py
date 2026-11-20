@@ -2,6 +2,10 @@
 
 import re
 
+# `dependencies = [ "a", "b 1.2.3", "c 0.1.0 (registry+https://…)" ]` — the
+# first token of each quoted entry is the crate name.
+_CARGO_DEPS_RE = re.compile(r'^dependencies\s*=\s*\[(.*?)\]', re.MULTILINE | re.DOTALL)
+
 
 def from_cargo_lock(text: str) -> list[dict]:
     """Cargo.lock — TOML [[package]] sections with name/version.
@@ -12,6 +16,10 @@ def from_cargo_lock(text: str) -> list[dict]:
       - "registry+…" / "sparse+…" → registry (no origin key set)
     Repos with only a Cargo.toml (no Cargo.lock) carry no origin signal —
     documented limitation.
+
+    `depends_on` (dependency-graph reachability): the crate names in the
+    section's `dependencies = [...]` array (empty list when absent — Cargo.lock
+    records every package's full dependency list, so edges are always known).
 
     `resolved_url` (Dependency Confusion Exposure signal): the source line's
     URL part with its registry+/sparse+/git+ protocol prefix stripped — e.g.
@@ -31,6 +39,11 @@ def from_cargo_lock(text: str) -> list[dict]:
             "version":        ver_m.group(1),
             "version_source": "resolved",
         }
+        deps_m = _CARGO_DEPS_RE.search(section)
+        dep["depends_on"] = (
+            [e.split()[0] for e in re.findall(r'"([^"]+)"', deps_m.group(1)) if e.split()]
+            if deps_m else []
+        )
         src_m = re.search(r'^source\s*=\s*"([^"]+)"', section, re.MULTILINE)
         if src_m is None:
             dep["origin"] = "path"

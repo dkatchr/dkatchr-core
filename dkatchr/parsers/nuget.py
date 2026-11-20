@@ -56,16 +56,25 @@ def from_packages_lock_json(text: str) -> list[dict]:
         return []
     deps = []
     seen = set()
+    # `depends_on` (dependency-graph reachability): each entry's own
+    # `dependencies` map, unioned across target frameworks per package name.
+    edges: dict[str, set[str]] = {}
     for tfm, pkgs in (data.get("dependencies") or {}).items():
         if not isinstance(pkgs, dict):
             continue
         for name, meta in pkgs.items():
             if not isinstance(meta, dict):
                 continue
+            if name:
+                edges.setdefault(name, set()).update(
+                    (meta.get("dependencies") or {}).keys()
+                    if isinstance(meta.get("dependencies"), dict) else ())
             ver = meta.get("resolved", "")
             if name and ver:
                 key = (name, ver)
                 if key not in seen:
                     seen.add(key)
                     deps.append({"package": name, "version": ver, "version_source": "resolved"})
+    for dep in deps:
+        dep["depends_on"] = sorted(edges.get(dep["package"], set()))
     return deps

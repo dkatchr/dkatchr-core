@@ -15,6 +15,13 @@ the format doesn't record it: yarn Berry (`resolution: "pkg@npm:ver"`) and pnpm
 (`resolution: {integrity: …}`) carry a resolution PROTOCOL but no URL (verified
 against real lockfiles), so their coverage is protocol-level only — the
 historical confusion check cannot see which registry host served them.
+
+Dependency `depends_on` (dependency-graph reachability): every LOCKFILE parser
+attaches the names each package depends on (dependencies + optional + peer —
+over-approximated edges can only over-flag). Edges are collected per package
+NAME across all entries/versions of that name, matching the name-level graph
+the reachability core builds. package.json is a declaration, not a resolved
+graph, so its rows carry no `depends_on` (= edges unknown).
 """
 
 import json
@@ -70,6 +77,16 @@ def from_package_json(text: str) -> list[dict]:
     return deps
 
 
+_EDGE_SECTIONS = ("dependencies", "optionalDependencies", "peerDependencies")
+
+
+def _attach_edges(deps: list[dict], edges: dict[str, set[str]]) -> list[dict]:
+    """Set `depends_on` on every row from the per-name edge map (known = [])."""
+    for dep in deps:
+        dep["depends_on"] = sorted(edges.get(dep["package"], set()))
+    return deps
+
+
 def from_package_lock(text: str) -> list[dict]:
     """Handle package-lock.json v1 (npm 5/6) and v2/v3 (npm 7+)."""
     try:
@@ -78,6 +95,7 @@ def from_package_lock(text: str) -> list[dict]:
         return []
 
     deps: list[dict] = []
+    edges: dict[str, set[str]] = {}
     lock_version = data.get("lockfileVersion", 1)
 
     if lock_version >= 2 and "packages" in data:
@@ -107,6 +125,11 @@ def from_package_lock(text: str) -> list[dict]:
                 if meta.get("link") is True:
                     origin = "workspace"
             ver = meta.get("version", "")
+            if name:
+                bucket = edges.setdefault(name, set())
+                for sec in _EDGE_SECTIONS:
+                    if isinstance(meta.get(sec), dict):
+                        bucket.update(meta[sec].keys())
             if name and (ver or origin):
                 # Version-less non-registry entries keep their raw spec: the
                 # resolved URL when one exists, else the workspace path (key).
@@ -126,6 +149,9 @@ def from_package_lock(text: str) -> list[dict]:
                 if not isinstance(meta, dict):
                     continue
                 ver = meta.get("version", "")
+                bucket = edges.setdefault(name, set())
+                if isinstance(meta.get("requires"), dict):
+                    bucket.update(meta["requires"].keys())
                 if ver:
                     dep = {"package": name, "version": ver, "version_source": "resolved"}
                     resolved = meta.get("resolved")
@@ -137,7 +163,7 @@ def from_package_lock(text: str) -> list[dict]:
                     _walk(nested)
         _walk(data.get("dependencies") or {})
 
-    return deps
+    return _attach_edges(deps, edges)
 
 
 def _yarn_key_origin(spec: str) -> str | None:
@@ -161,8 +187,61 @@ def _yarn_key_origin(spec: str) -> str | None:
     return None
 
 
+# Inside a yarn.lock entry: a `dependencies:` / `optionalDependencies:` /
+# `peerDependencies:` header, then deeper-indented `name "range"` (v1) or
+# `name: range` (Berry) lines. The name may be quoted ("@scope/pkg").
+_YARN_EDGE_HEADER = re.compile(r"^(\s+)(dependencies|optionalDependencies|peerDependencies):\s*$")
+_YARN_EDGE_LINE = re.compile(r'^\s+"?(@?[^"\s:]+)"?:?\s')
+
+
+def _yarn_entry_names(header: str) -> list[str]:
+    names = []
+    for part in header.rstrip(":").split(","):
+        spec = part.strip().strip('"')
+        if not spec:
+            continue
+        at = spec.find("@", 1)   # skip a leading scope '@'
+        name = spec[:at] if at > 0 else spec
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _yarn_edges(text: str) -> dict[str, set[str]]:
+    """Per-package-name dependency edges for both yarn.lock formats."""
+    edges: dict[str, set[str]] = {}
+    for stanza in re.split(r"\n{2,}", text):
+        lines = stanza.strip("\n").splitlines()
+        if not lines or lines[0].startswith(("#", "__metadata")) or lines[0][:1].isspace():
+            continue
+        owners = _yarn_entry_names(lines[0])
+        found: set[str] = set()
+        in_section_indent = None
+        for line in lines[1:]:
+            h = _YARN_EDGE_HEADER.match(line)
+            if h:
+                in_section_indent = len(h.group(1))
+                continue
+            if in_section_indent is None:
+                continue
+            indent = len(line) - len(line.lstrip())
+            if indent <= in_section_indent:
+                in_section_indent = None
+                continue
+            m = _YARN_EDGE_LINE.match(line)
+            if m:
+                found.add(m.group(1))
+        for owner in owners:
+            edges.setdefault(owner, set()).update(found)
+    return edges
+
+
 def from_yarn_lock(text: str) -> list[dict]:
     """Handles both classic (v1) and Berry (v2+) formats."""
+    return _attach_edges(_from_yarn_lock_rows(text), _yarn_edges(text))
+
+
+def _from_yarn_lock_rows(text: str) -> list[dict]:
     deps: list[dict] = []
 
     if "__metadata:" in text:
@@ -226,8 +305,59 @@ def from_yarn_lock(text: str) -> list[dict]:
     return deps
 
 
+def _pnpm_key_name(key: str) -> str | None:
+    """Package name from a pnpm packages/snapshots key across v5/v6/v9:
+    '/lodash/4.17.21', '/@s/p/1.0.0' (v5); '/lodash@4.17.21', '@s/p@1.0.0',
+    "'@s/p@1.0.0(peer@2.0.0)'" (v6/v9)."""
+    k = key.strip().strip("'\"").split("(", 1)[0].lstrip("/")
+    if not k:
+        return None
+    at = k.rfind("@")
+    if at > 0:                       # v6/v9: name@version
+        return k[:at]
+    parts = k.split("/")             # v5: name/version or @scope/name/version
+    if len(parts) >= 2:
+        return "/".join(parts[:-1])
+    return None
+
+
+def _pnpm_edges(text: str) -> dict[str, set[str]]:
+    edges: dict[str, set[str]] = {}
+    section = None
+    owner = None
+    in_deps = False
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent == 0:
+            section = line.rstrip(":").strip()
+            owner, in_deps = None, False
+            continue
+        if section not in ("packages", "snapshots"):
+            continue
+        if indent == 2 and line.rstrip().endswith(":"):
+            owner = _pnpm_key_name(line.strip()[:-1])
+            if owner:
+                edges.setdefault(owner, set())
+            in_deps = False
+            continue
+        if indent == 4:
+            in_deps = line.strip().rstrip(":") in _EDGE_SECTIONS
+            continue
+        if indent >= 6 and in_deps and owner:
+            name = line.strip().split(":", 1)[0].strip().strip("'\"")
+            if name:
+                edges[owner].add(name)
+    return edges
+
+
 def from_pnpm_lock(text: str) -> list[dict]:
     """Supports v5 (pnpm 6), v6 (pnpm 7/8), v9 (pnpm 9)."""
+    return _attach_edges(_from_pnpm_lock_rows(text), _pnpm_edges(text))
+
+
+def _from_pnpm_lock_rows(text: str) -> list[dict]:
     deps: list[dict] = []
     seen: set[tuple] = set()
 
@@ -238,12 +368,15 @@ def from_pnpm_lock(text: str) -> list[dict]:
             deps.append({"package": name, "version": ver, "version_source": "resolved"})
 
     # v5: /lodash/4.17.21:  or  /@scope/pkg/1.0.0:
-    v5 = re.compile(r"^/(@?[^/\n]+(?:/@?[^/\n]+)?)/(\d[^:\s(]*):", re.MULTILINE)
+    # Keys sit under `packages:` indented by 2 spaces in real lockfiles; the
+    # old `^/` anchor never matched them (every v5/v6 lockfile parsed empty).
+    v5 = re.compile(r"^[ \t]*/(@?[^/\n]+(?:/@?[^/\n]+)?)/(\d[^:\s(]*)(?:\([^\n]*\))?:", re.MULTILINE)
     for m in v5.finditer(text):
         _add(m.group(1), m.group(2))
 
     # v6: /lodash@4.17.21:  or  /@scope/pkg@1.0.0:
-    v6 = re.compile(r"^/(@?[^@/\n]+(?:/@?[^@/\n]+)?)@(\d[^:\s(]*):", re.MULTILINE)
+    # A trailing peer-dependency suffix "(debug@4.3.4)" may sit before the ':'.
+    v6 = re.compile(r"^[ \t]*/(@?[^@/\n]+(?:/@?[^@/\n]+)?)@(\d[^:\s(]*)(?:\([^\n]*\))?:", re.MULTILINE)
     for m in v6.finditer(text):
         _add(m.group(1), m.group(2))
 
@@ -252,7 +385,9 @@ def from_pnpm_lock(text: str) -> list[dict]:
     # "  '@scope/pkg@1.0.0':". Mirror the v9_url regex's leading `'?` + `'`-excluded
     # char classes + trailing `'?` so quoted scoped keys are parsed (without it,
     # every scoped dep in a pnpm v9 lockfile was silently dropped).
-    v9 = re.compile(r"^\s{2}'?(@?[^@\n/'][^@\n']*)@(\d[^:\s(']*)'?:", re.MULTILINE)
+    # Literal two-space indent: `\s{2}` also matched "\n " across a blank line
+    # and produced bogus " /name" rows from v6 keys.
+    v9 = re.compile(r"^ {2}'?(@?[^@\n/' ][^@\n']*)@(\d[^:\s(']*)(?:\([^\n']*\))?'?:", re.MULTILINE)
     for m in v9.finditer(text):
         _add(m.group(1).strip(), m.group(2))
 
@@ -261,7 +396,9 @@ def from_pnpm_lock(text: str) -> list[dict]:
     # spec. v5/v6 git entries don't carry the package name in their key at
     # all ("github.com/user/repo/sha:") and are skipped as ambiguous.
     v9_url = re.compile(
-        r"^\s{2}'?(@?[^@\n/'][^@\n']*)@((?:git\+|git://|https?://)[^:\s(']*)'?:",
+        # The URL itself contains ':' ("https://"), so match to the key's
+        # trailing ':' at end of line rather than stopping at the first ':'.
+        r"^ {2}'?(@?[^@\n/' ][^@\n']*)@((?:git\+|git://|https?://)[^\s(']*?)'?:[ \t]*$",
         re.MULTILINE,
     )
     for m in v9_url.finditer(text):

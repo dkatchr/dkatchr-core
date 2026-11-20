@@ -161,6 +161,11 @@ def from_pipfile_lock(text: str) -> list[dict]:
 # read (reference/resolved_reference are git bookkeeping).
 _POETRY_SOURCE_RE = re.compile(
     r"\n\[package\.source\]\s*\n(.*?)(?=\n\[|\Z)", re.DOTALL)
+# [package.dependencies] sub-table: one `name = <spec>` line per dependency
+# (spec may be a string, an inline table, or an array of constraint tables).
+_POETRY_DEPS_RE = re.compile(
+    r"\n\[package\.dependencies\]\s*\n(.*?)(?=\n\[|\Z)", re.DOTALL)
+_POETRY_DEP_NAME_RE = re.compile(r'^"?([A-Za-z0-9][A-Za-z0-9._-]*)"?\s*=', re.MULTILINE)
 
 
 def from_poetry_lock(text: str) -> list[dict]:
@@ -187,6 +192,11 @@ def from_poetry_lock(text: str) -> list[dict]:
             "version":        ver_m.group(1),
             "version_source": "resolved",
         }
+        # Edges for dependency-graph reachability. poetry.lock lists every
+        # package's dependencies (incl. optional/extra-gated ones — kept: an
+        # over-approximated edge can only over-flag), so edges are known.
+        deps_m = _POETRY_DEPS_RE.search(section)
+        dep["depends_on"] = _POETRY_DEP_NAME_RE.findall(deps_m.group(1)) if deps_m else []
         src_m = _POETRY_SOURCE_RE.search(section)
         if src_m is None:
             dep["resolved_url"] = PYPI_DEFAULT_INDEX_URL

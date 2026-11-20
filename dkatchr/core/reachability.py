@@ -25,6 +25,13 @@ ACCURACY NOTES:
   are a source of false negatives. Level 2 LLM analysis addresses this.
 - Test files are excluded by default (configurable). A package used only in tests
   is labelled UNUSED with no evidence.
+- TRANSITIVE dependencies (dependency-graph reachability): pass a
+  DependencyGraph (dkatchr/core/dependency_graph.py) and a vulnerable package
+  that your code never imports is still REACHABLE when an imported package
+  depends on it (certifi via requests), with the shortest chain recorded in
+  row["reachability_path"]; it is UNUSED only when the graph proves nothing
+  imported can load it, and UNKNOWN when edges or import checks are missing.
+  Without a graph, behaviour is exactly the import-presence check above.
 - Minified bundles, generated protobufs, and other files over
   REACHABILITY_MAX_FILE_BYTES are skipped — they will not contain readable import
   statements anyway and would dominate scan time.
@@ -50,12 +57,20 @@ import ahocorasick
 from dkatchr.clients.github import GitHubClient, TarballSizeExceeded
 from dkatchr.clients.resolvers import ImportNameResolver
 from dkatchr.config import (
+    GRAPH_MAX_PROBE_PACKAGES,
     REACHABILITY_MAX_FILE_BYTES,
     REACHABILITY_SCAN_PROGRESS_EVERY,
     REACHABILITY_SNIPPET_MAX_CHARS,
     REACHABILITY_SOURCE_EXTENSIONS,
     REACHABILITY_TEST_FILE_PATTERNS,
     REGISTRY_RESOLVER_WORKERS,
+)
+from dkatchr.core.dependency_graph import (
+    NOT_REACHABLE as _G_NOT_REACHABLE,
+    REACHABLE as _G_REACHABLE,
+    DependencyGraph,
+    decide_transitive,
+    normalize_name,
 )
 from dkatchr.logger import log
 from dkatchr.storage.reachability_cache import ReachabilityCache
@@ -453,6 +468,7 @@ def enrich_reachability(
     extra_patterns: list[str] | None = None,
     match_map_out: dict[str, list[str]] | None = None,
     extra_hits_out: dict[str, list[dict]] | None = None,
+    dependency_graph: DependencyGraph | None = None,
 ) -> list[dict]:
     """
     For each vuln row, decide REACHABLE / UNUSED / UNKNOWN by searching
@@ -497,6 +513,16 @@ def enrich_reachability(
     {pattern: [{"file", "line", "snippet"}]} (see _grep_tar_stream). Pure
     capture mechanics; this function attaches no meaning to the hits.
 
+    `dependency_graph` (optional) turns on dependency-graph reachability: the
+    import search additionally covers each vulnerable package's probe set
+    (packages that could load it — DependencyGraph.probe_set), in the SAME
+    single tarball pass, and every vulnerable package not imported directly
+    gets a graph verdict via decide_transitive(), recorded as
+    row["reachability_path"] (a dict: method/verdict/chain/anchor_files/
+    reason). A cached run that never searched those packages is treated as a
+    cache miss. More probe packages than GRAPH_MAX_PROBE_PACKAGES -> the graph
+    is skipped for this repo (phase graph_skipped).
+
     `on_progress` (optional) emits phase events so orchestrators (CLI, web
     runner) can surface what's happening to humans waiting on a slow scan.
     Phases: cache_hit, cache_hit_partial_retry, resolving_start,
@@ -518,6 +544,30 @@ def enrich_reachability(
         except Exception:
             pass
 
+    # Probe set for dependency-graph reachability: every package that could
+    # load a vulnerable one. Their import status is searched alongside the
+    # vulnerable packages' in the same automaton.
+    graph = dependency_graph
+    probe_pairs: list[tuple[str, str]] = []
+    if graph is not None:
+        vuln_keys = {(r.get("package", ""), r.get("ecosystem", "")) for r in vuln_rows}
+        probe_nodes: set = set()
+        for pkg, eco in vuln_keys:
+            node = (eco, normalize_name(eco, pkg))
+            if graph.applies_to(eco) and node in graph.edges:
+                probe_nodes |= graph.probe_set(node)
+        seen_probe = {(eco, normalize_name(eco, pkg)) for pkg, eco in vuln_keys}
+        probe_pairs = sorted((graph.display.get(n, n[1]), n[0]) for n in probe_nodes
+                             if n not in seen_probe)
+        if len(probe_pairs) > GRAPH_MAX_PROBE_PACKAGES:
+            _emit({"phase": "graph_skipped", "probe_packages": len(probe_pairs),
+                   "limit": GRAPH_MAX_PROBE_PACKAGES})
+            log(f"[reachability] {repo_full_name}: dependency graph skipped — "
+                f"{len(probe_pairs)} packages to probe > {GRAPH_MAX_PROBE_PACKAGES}")
+            graph, probe_pairs = None, []
+        else:
+            _emit({"phase": "graph_probe", "probe_packages": len(probe_pairs)})
+
     # ---- 1. cache check ------------------------------------------------
     # Skipped when extra patterns are present: the cached match map covers
     # only the import patterns of the original run and was (potentially)
@@ -536,19 +586,19 @@ def enrich_reachability(
         missing_pairs: list[tuple[str, str]] = []
         seen_missing: set[tuple[str, str]] = set()
         retry_versions: dict[tuple[str, str], str] = {}
-        for row in vuln_rows:
-            pkg = row.get("package", "")
-            eco = row.get("ecosystem", "")
+        candidates = [((r.get("package", ""), r.get("ecosystem", "")), r.get("version") or "")
+                      for r in vuln_rows] + [(p, "") for p in probe_pairs]
+        for pair, v in candidates:
+            pkg, eco = pair
             if f"{pkg}::{eco}" in cached_results:
                 continue
-            pair = (pkg, eco)
             if pair in seen_missing:
                 continue
             seen_missing.add(pair)
             missing_pairs.append(pair)
-            v = row.get("version") or ""
             if v and pair not in retry_versions:
                 retry_versions[pair] = v
+        undecided = False   # a package whose patterns the cached run never searched
 
         if missing_pairs:
             _emit({
@@ -590,7 +640,10 @@ def enrich_reachability(
                 else:
                     # Not all patterns were searched in the original run —
                     # leave the package out of results (→ UNKNOWN this scan;
-                    # a fresh-SHA scan will search it for real).
+                    # a fresh-SHA scan will search it for real). With a
+                    # dependency graph, re-grep instead: a graph verdict on
+                    # unsearched data would be UNKNOWN for the same SHA forever.
+                    undecided = True
                     continue
                 cached_results[f"{package}::{ecosystem}"] = {
                     "label":    label,
@@ -602,8 +655,11 @@ def enrich_reachability(
         else:
             _emit({"phase": "cache_hit", "sha": sha[:8]})
 
-        _apply_results_to_rows(vuln_rows, cached_results)
-        return vuln_rows
+        if not (graph is not None and undecided):
+            _apply_results_to_rows(vuln_rows, cached_results)
+            _apply_graph_verdicts(vuln_rows, cached_results, graph, probe_pairs)
+            return vuln_rows
+        _emit({"phase": "graph_regrep", "sha": sha[:8]})
 
     def _dl_progress(downloaded: int, total: int | None) -> None:
         _emit({
@@ -618,13 +674,12 @@ def enrich_reachability(
     unique_pairs: list[tuple[str, str]] = []
     seen_pairs: set[tuple[str, str]] = set()
     pair_versions: dict[tuple[str, str], str] = {}
-    for row in vuln_rows:
-        key = (row.get("package", ""), row.get("ecosystem", ""))
+    for key, v in ([((r.get("package", ""), r.get("ecosystem", "")), r.get("version") or "")
+                    for r in vuln_rows] + [(p, "") for p in probe_pairs]):
         if key in seen_pairs:
             continue
         seen_pairs.add(key)
         unique_pairs.append(key)
-        v = row.get("version") or ""
         if v and key not in pair_versions:
             pair_versions[key] = v
 
@@ -777,7 +832,47 @@ def enrich_reachability(
 
     # ---- 9. apply to rows ---------------------------------------------
     _apply_results_to_rows(vuln_rows, results)
+    _apply_graph_verdicts(vuln_rows, results, graph, probe_pairs)
     return vuln_rows
+
+
+def _apply_graph_verdicts(vuln_rows: list[dict], results: dict,
+                          graph: DependencyGraph | None,
+                          probe_pairs: list[tuple[str, str]]) -> None:
+    """Dependency-graph verdict for every vulnerable package that is NOT
+    imported directly. A direct import stays REACHABLE with no path (the
+    import itself is the evidence). Writes row["reachability_path"]."""
+    if graph is None:
+        return
+    pairs = {(r.get("package", ""), r.get("ecosystem", "")) for r in vuln_rows} | set(probe_pairs)
+    imported: dict = {}
+    import_unknown: set = set()
+    for pkg, eco in pairs:
+        node = (eco, normalize_name(eco, pkg))
+        entry = results.get(f"{pkg}::{eco}")
+        if entry is None or entry.get("label") == UNKNOWN:
+            import_unknown.add(node)       # resolution failed: import status unknown
+        elif entry.get("label") == REACHABLE:
+            imported[node] = list(entry.get("evidence") or [])
+    for row in vuln_rows:
+        if row.get("reachability") == REACHABLE:
+            continue
+        eco, pkg = row.get("ecosystem", ""), row.get("package", "")
+        node = (eco, normalize_name(eco, pkg))
+        if not graph.applies_to(eco) or node not in graph.edges:
+            continue
+        same_eco = {n: f for n, f in imported.items() if n[0] == eco}
+        v = decide_transitive(graph, node, same_eco, import_unknown)
+        row["reachability_path"] = v.to_dict()
+        if v.verdict == _G_REACHABLE:
+            row["reachability"] = REACHABLE
+            row["reachability_evidence"] = "|".join(v.anchor_files)
+        elif v.verdict == _G_NOT_REACHABLE:
+            row["reachability"] = UNUSED
+            row["reachability_evidence"] = ""
+        else:
+            row["reachability"] = UNKNOWN
+            row["reachability_evidence"] = v.reason
 
 
 def _apply_results_to_rows(vuln_rows: list[dict], results: dict) -> None:
