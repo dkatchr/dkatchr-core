@@ -10,6 +10,7 @@ output rows. The client (now clients/osv.py) is just the network layer.
 """
 
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from dkatchr.clients.osv import OSVClient
@@ -117,10 +118,37 @@ def osv_cvss_score(vuln: dict) -> float | None:
     return None
 
 
-def osv_fix_versions(vuln: dict) -> str:
+def _same_package(ecosystem: str, a: str, b: str) -> bool:
+    if ecosystem == "PyPI":
+        norm = lambda n: re.sub(r"[-_.]+", "-", n).lower()
+        return norm(a) == norm(b)
+    if ecosystem in ("NuGet", "Packagist", "RubyGems"):
+        return a.lower() == b.lower()
+    return a == b
+
+
+def osv_fix_versions(vuln: dict, ecosystem: str | None = None,
+                     package: str | None = None) -> str:
+    """Comma-separated fixed versions.
+
+    With `ecosystem` + `package`, only the advisory's affected entry for THAT
+    package counts: one advisory often covers many packages (HTTP/2 rapid reset
+    lists Jetty, Tomcat, Netty and golang.org/x/net), and their fixed versions
+    are not upgrades for this one. GIT ranges (commit hashes) are never
+    versions to upgrade to and are always skipped. If no affected entry names
+    the package (an alias / naming mismatch), every ecosystem-version fix is
+    returned, as before."""
+    affected = [a for a in (vuln.get("affected") or []) if isinstance(a, dict)]
+    if ecosystem and package:
+        own = [a for a in affected
+               if (a.get("package") or {}).get("ecosystem") == ecosystem
+               and _same_package(ecosystem, (a.get("package") or {}).get("name") or "", package)]
+        affected = own or affected
     fixes: set[str] = set()
-    for affected in vuln.get("affected") or []:
-        for r in affected.get("ranges") or []:
+    for a in affected:
+        for r in a.get("ranges") or []:
+            if (r.get("type") or "").upper() == "GIT":
+                continue
             for evt in r.get("events") or []:
                 if isinstance(evt, dict) and "fixed" in evt:
                     fixes.add(str(evt["fixed"]))
@@ -354,7 +382,7 @@ def osv_rows_for_repo(
             row["severity"]     = osv_severity(v)
             row["cvss_score"]   = osv_cvss_score(v)
             row["summary"]      = osv_summary(v)
-            row["fix_versions"] = osv_fix_versions(v)
+            row["fix_versions"] = osv_fix_versions(v, dep["ecosystem"], dep["package"])
             row["cwe_ids"]      = osv_cwe_ids(v)
             row["published"]    = osv_published(v)
             row["exploit_refs"] = osv_exploit_refs(v)
