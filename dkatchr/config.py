@@ -68,7 +68,9 @@ ATTRIBUTION_CACHE_SCHEMA: int = 1
 #     manifests, resolved via deps.dev / the NuGet registry.
 # v10: transitive rows and "already pinned" decided per directory (monorepo
 #      sub-projects), `pinned` on requirements `==` rows.
-CACHE_SCHEMA = 10
+# v11: dev scope propagated through yarn.lock / pnpm-lock / Gemfile.lock edges;
+#      Gemfile.lock DEPENDENCIES rows flagged `direct`.
+CACHE_SCHEMA = 11
 
 # Bundler group names that mean "not installed in production" — the
 # conventional names (`bundle config set without development test`), not a

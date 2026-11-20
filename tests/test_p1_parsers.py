@@ -261,3 +261,65 @@ def test_dedupe_keeps_dev_only_when_all_rows_are_dev():
     a = extract_file_inventory("package.json", '{"devDependencies": {"lodash": "4.17.21"}}')
     c = extract_file_inventory("tools/package.json", '{"devDependencies": {"lodash": "4.17.21"}}')
     assert dedupe_inventory(a + c)[0].get("scope") == "dev"
+
+
+# ---- dev scope through lockfile edges (yarn / pnpm / Gemfile.lock) ----------
+
+from dkatchr.core.inventory import propagate_dev_scope
+from dkatchr.parsers.ruby import from_gemfile_lock
+
+
+def _r(file, pkg, src, deps=None, **kw):
+    row = {"file": file, "ecosystem": "npm", "package": pkg, "version": "1.0.0",
+           "version_source": src, "origin": "registry", **kw}
+    if deps is not None:
+        row["depends_on"] = deps
+    return row
+
+
+def test_packages_only_reachable_from_dev_roots_become_dev():
+    inv = [_r("package.json", "@vitejs/plugin-react", "declared", scope="dev"),
+           _r("package.json", "react", "declared"),
+           _r("yarn.lock", "@vitejs/plugin-react", "resolved", ["vite"]),
+           _r("yarn.lock", "vite", "resolved", ["esbuild", "loose-envify"]),
+           _r("yarn.lock", "esbuild", "resolved", []),
+           _r("yarn.lock", "react", "resolved", ["loose-envify"]),
+           _r("yarn.lock", "loose-envify", "resolved", [])]
+    propagate_dev_scope(inv)
+    scope = {r["package"]: r.get("scope") for r in inv if r["file"] == "yarn.lock"}
+    assert scope["vite"] == "dev" and scope["esbuild"] == "dev"
+    assert scope["loose-envify"] is None          # also reached from runtime react
+    assert scope["react"] is None
+
+
+def test_workspaces_are_left_alone():
+    inv = [_r("package.json", "eslint", "declared", scope="dev"),
+           _r("packages/app/package.json", "lodash", "declared"),
+           _r("yarn.lock", "eslint", "resolved", ["lodash"]),
+           _r("yarn.lock", "lodash", "resolved", [])]
+    propagate_dev_scope(inv)
+    assert all(r.get("scope") != "dev" for r in inv if r["file"] == "yarn.lock")
+
+
+def test_gemfile_lock_direct_dependencies_count_as_runtime_roots():
+    lock = """GEM
+  remote: https://rubygems.org/
+  specs:
+    json (2.7.1)
+    rubocop (1.60.0)
+      json (~> 2.3)
+      parser (>= 3.3)
+    parser (3.3.0.5)
+
+DEPENDENCIES
+  json
+  rubocop (~> 1.60)
+"""
+    rows = extract_file_inventory("Gemfile.lock", lock)
+    # The Gemfile gives rubocop (dev group, versioned); `json` is unversioned
+    # there, so only Gemfile.lock's DEPENDENCIES knows it is a direct runtime gem.
+    rows += extract_file_inventory("Gemfile", 'group :development do\n  gem "rubocop", "1.60.0"\nend\ngem "json"\n')
+    propagate_dev_scope(rows)
+    scope = {r["package"]: r.get("scope") for r in rows if r["file"] == "Gemfile.lock"}
+    assert scope["parser"] == "dev"
+    assert scope["json"] is None                  # runtime root, despite rubocop using it

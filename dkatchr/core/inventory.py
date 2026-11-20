@@ -70,7 +70,70 @@ def _to_row(file_path: str, ecosystem: str, dep: dict) -> dict:
         row["scope"] = "dev"
     if dep.get("pinned"):
         row["pinned"] = True
+    if dep.get("direct"):
+        row["direct"] = True
     return row
+
+
+# Lockfiles that record dependency edges but NOT which packages are
+# development-only — dev scope has to be derived from the manifest's roots.
+_NO_DEV_INFO_LOCKFILES = frozenset({"yarn.lock", "pnpm-lock.yaml", "Gemfile.lock"})
+
+
+def propagate_dev_scope(inventory: list[dict]) -> None:
+    """Mark lockfile packages development-only when they are reachable ONLY
+    from dev dependencies, for lockfiles that do not record dev flags
+    themselves (yarn.lock, pnpm-lock.yaml, Gemfile.lock). In place.
+
+    Per directory: roots are the manifest's declared rows plus the lockfile's
+    own `direct` rows (Gemfile.lock DEPENDENCIES — complete even for gems the
+    Gemfile lists without a version); a root is dev when every declared row for
+    it says so. A lockfile package reached from any non-dev root stays runtime:
+    marking a production package dev-only would halve its score, so the rule
+    errs toward runtime."""
+    by_dir: dict[tuple[str, str], list[dict]] = {}
+    for row in inventory:
+        by_dir.setdefault((row.get("ecosystem", ""), os.path.dirname(row.get("file", ""))), []).append(row)
+    locked_dirs = {k for k, rows in by_dir.items()
+                   if any(r.get("version_source") == "resolved" for r in rows)}
+    for (eco, d), rows in by_dir.items():
+        lock_rows = [r for r in rows
+                     if os.path.basename(r.get("file", "")) in _NO_DEV_INFO_LOCKFILES]
+        if not lock_rows:
+            continue
+        # Workspaces: one lockfile serving manifests in sub-folders (that have
+        # no lockfile of their own). Their roots aren't visible from here, so
+        # nothing in this lockfile can be proven dev-only — skip.
+        prefix = f"{d}/" if d else ""
+        if any(e == eco and sd != d and sd.startswith(prefix) and (e, sd) not in locked_dirs
+               and any(r.get("version_source") == "declared" for r in srows)
+               for (e, sd), srows in by_dir.items()):
+            continue
+        declared: dict[str, bool] = {}          # name -> all declared rows dev?
+        for r in rows:
+            if r.get("version_source") == "declared":
+                declared[r["package"]] = declared.get(r["package"], True) and r.get("scope") == "dev"
+        if not any(declared.values()):
+            continue                            # no dev roots: nothing to mark
+        roots = set(declared) | {r["package"] for r in lock_rows if r.get("direct")}
+        edges: dict[str, set[str]] = {}
+        for r in lock_rows:
+            edges.setdefault(r["package"], set()).update(r.get("depends_on") or [])
+
+        def reach(starts: set[str]) -> set[str]:
+            seen, stack = set(starts), list(starts)
+            while stack:
+                for nxt in edges.get(stack.pop(), ()):
+                    if nxt not in seen:
+                        seen.add(nxt)
+                        stack.append(nxt)
+            return seen
+
+        runtime = reach({n for n in roots if not declared.get(n, False)})
+        dev = reach({n for n in roots if declared.get(n, False)})
+        for r in lock_rows:
+            if r["package"] in dev and r["package"] not in runtime:
+                r["scope"] = "dev"
 
 
 def dedupe_inventory(inventory: list[dict]) -> list[dict]:

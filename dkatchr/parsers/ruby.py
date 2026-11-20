@@ -153,11 +153,20 @@ def from_gemfile_lock(text: str) -> list[dict]:
     # resolved spec's own dependencies under it, so edges are known.
     edges: dict[str, set[str]] = {}
     current: str | None = None
+    # DEPENDENCIES lists every gem the Gemfile asks for (all groups, with or
+    # without a version) — the complete set of direct dependencies, which dev
+    # scope propagation needs (the Gemfile parser skips unversioned gems).
+    direct: set[str] = set()
     for line in text.splitlines():
         if line and not line[0].isspace():
             section = line.strip()
             remotes = []
             current = None
+            continue
+        if section == "DEPENDENCIES":
+            dm2 = re.match(r"^  ([A-Za-z0-9_.\-]+)", line)
+            if dm2:
+                direct.add(dm2.group(1))
             continue
         dm = _LOCK_SPEC_DEP.match(line)
         if dm and current is not None:
@@ -192,4 +201,6 @@ def from_gemfile_lock(text: str) -> list[dict]:
         deps.append(dep)
     for dep in deps:
         dep["depends_on"] = sorted(edges.get(dep["package"], set()))
+        if dep["package"] in direct:
+            dep["direct"] = True
     return deps
