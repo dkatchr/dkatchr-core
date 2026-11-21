@@ -32,9 +32,11 @@ from dkatchr.core.inventory import (
     extract_maven_project_inventory,
 )
 from dkatchr.core.rules import apply_rules
+from dkatchr.core.runtime_inventory import expand_image_runtimes
 from dkatchr.core.transitive import expand_transitive
 from dkatchr.logger import log, repo_log
 from dkatchr.parsers import manifest_handler
+from dkatchr.parsers.runtime import extract_runtime_inventory, is_runtime_source
 from dkatchr.storage.inventory_cache import InventoryCache
 
 # Callback signature: progress({"phase": str, ...}) — emit liveness/progress
@@ -50,6 +52,7 @@ class Scanner:
         cache: InventoryCache,
         package_config: dict,
         transitive_resolver=None,
+        image_resolver=None,
     ) -> None:
         self.github         = github
         self.cache          = cache
@@ -57,6 +60,10 @@ class Scanner:
         # Optional TransitiveResolver: adds the packages that direct
         # dependencies of lockfile-less manifests pull in. None = off.
         self.transitive     = transitive_resolver
+        # Optional ImageTagResolver: resolves floating public base-image tags
+        # (FROM ruby:3.2) to the runtime version they ship today. None = the
+        # tag text is used (reported at its minimum version).
+        self.image_resolver = image_resolver
 
     def _manifests_from_tarball(self, repo: dict, sha: str, manifest_blobs: list[dict],
                                 on_progress: ProgressCb) -> dict[str, str]:
@@ -179,7 +186,8 @@ class Scanner:
             manifest_blobs = [
                 n for n in tree
                 if n.get("type") == "blob"
-                and manifest_handler(os.path.basename(n.get("path", ""))) is not None
+                and (manifest_handler(os.path.basename(n.get("path", ""))) is not None
+                     or is_runtime_source(n.get("path", "")))
             ]
             total_manifests = len(manifest_blobs)
             if on_progress:
@@ -210,8 +218,11 @@ class Scanner:
 
                 if os.path.basename(path) == "pom.xml":
                     poms[path] = content
-                else:
+                elif manifest_handler(os.path.basename(path)) is not None:
                     inventory.extend(extract_file_inventory(path, content))
+                # Language runtimes + container images this file names
+                # (version files, Dockerfiles, compose/k8s/Helm, CI workflows).
+                inventory.extend(extract_runtime_inventory(path, content))
 
                 # Tick every 5 manifests (or at the end). Cheap, keeps UI alive.
                 if on_progress and (i % 5 == 0 or i == total_manifests):
@@ -244,6 +255,12 @@ class Scanner:
                     inventory.extend(extra)
                 except Exception as e:
                     log(f"    [!] {full_name}: transitive resolution failed: {e}")
+
+            try:
+                resolve = self.image_resolver.resolve if self.image_resolver is not None else None
+                inventory.extend(expand_image_runtimes(inventory, resolve))
+            except Exception as e:
+                log(f"    [!] {full_name}: container image runtime expansion failed: {e}")
 
             try:
                 propagate_dev_scope(inventory)

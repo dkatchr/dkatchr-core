@@ -28,7 +28,7 @@ import time
 import requests
 
 from dkatchr.clients.ratelimit import TokenBucket
-from dkatchr.config import NVD_BASE_URL, NVD_RATE_NO_KEY, NVD_RATE_WITH_KEY
+from dkatchr.config import DEFAULT_NVD_CPE_TTL, NVD_BASE_URL, NVD_RATE_NO_KEY, NVD_RATE_WITH_KEY
 from dkatchr.logger import log
 
 # NVD's rate budget is expressed per rolling 30-second window; TokenBucket
@@ -127,3 +127,86 @@ class NVDClient:
             self._write_cache(path, data)
             return data
         return None
+
+
+    # ---- version-aware product lookup (runtime scanning) -------------------
+
+    def cves_for_product(self, cpe_vendor_product: str, version: str,
+                         ttl_seconds: int = DEFAULT_NVD_CPE_TTL) -> list[dict] | None:
+        """CVEs whose ANALYSED NVD configuration matches `vendor:product` at
+        `version` (virtualMatchString), as
+        [{id, summary, published, cvss_score, cvss_vector, cwe_ids, fixed}].
+
+        TTL'd per (product, version): NVD analyses CVEs late (many recent ones
+        stay "Received"/"Deferred" with no configuration at all — the CVE.org
+        index covers those), so a re-check picks newly analysed ranges up.
+        Returns None on failure (never raises).
+        """
+        key = re.sub(r"[^A-Za-z0-9._-]", "_", f"{cpe_vendor_product}@{version}")
+        path = os.path.join(self.cache_dir, "nvd_cpe", key + ".json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        cached = self._read_cache(path)
+        if cached is not None and time.time() - cached.get("fetched_at", 0) < ttl_seconds:
+            return cached.get("cves")
+        match = f"cpe:2.3:a:{cpe_vendor_product}:{version}"
+        headers = {"apiKey": self.api_key} if self.api_key else {}
+        out: list[dict] = []
+        start = 0
+        while True:
+            data = None
+            for attempt in range(4):
+                self.limiter.acquire()
+                try:
+                    resp = requests.get(NVD_BASE_URL, headers=headers, timeout=60, params={
+                        "virtualMatchString": match, "resultsPerPage": 2000, "startIndex": start})
+                except requests.RequestException as e:
+                    log(f"[!] NVD product {match}: {e}")
+                    time.sleep(2 ** attempt)
+                    continue
+                if resp.status_code in (429, 503) or resp.status_code >= 500:
+                    time.sleep(2 ** attempt + 1)
+                    continue
+                if resp.status_code != 200:
+                    log(f"[!] NVD product {match}: HTTP {resp.status_code}")
+                    return cached.get("cves") if cached else None
+                try:
+                    data = resp.json()
+                except ValueError:
+                    return cached.get("cves") if cached else None
+                break
+            if data is None:
+                return cached.get("cves") if cached else None
+            for item in data.get("vulnerabilities") or []:
+                out.append(_nvd_summary(item.get("cve") or {}, cpe_vendor_product, version))
+            start += data.get("resultsPerPage") or 0
+            if not data.get("resultsPerPage") or start >= data.get("totalResults", 0):
+                break
+        self._write_cache(path, {"fetched_at": time.time(), "cves": out})
+        return out
+
+
+def _nvd_summary(cve: dict, vendor_product: str, version: str) -> dict:
+    desc = next((d.get("value", "") for d in cve.get("descriptions") or [] if d.get("lang") == "en"), "")
+    best = None
+    metrics = cve.get("metrics") or {}
+    for key in ("cvssMetricV40", "cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+        for m in metrics.get(key) or []:
+            d = m.get("cvssData") or {}
+            if d.get("baseScore") is not None and (best is None or d["baseScore"] > best[0]):
+                best = (d["baseScore"], d.get("vectorString"))
+        if best:
+            break
+    fixed: list[str] = []
+    prefix = f"cpe:2.3:a:{vendor_product}:".lower()
+    for conf in cve.get("configurations") or []:
+        for node in conf.get("nodes") or []:
+            for cm in node.get("cpeMatch") or []:
+                if cm.get("vulnerable") and cm.get("criteria", "").lower().startswith(prefix):
+                    end = cm.get("versionEndExcluding")
+                    if end and end not in fixed:
+                        fixed.append(end)
+    cwes = sorted({d.get("value") for w in cve.get("weaknesses") or []
+                   for d in w.get("description") or [] if (d.get("value") or "").startswith("CWE-")})
+    return {"id": cve.get("id"), "summary": desc[:500], "published": cve.get("published", ""),
+            "cvss_score": best[0] if best else None, "cvss_vector": best[1] if best else None,
+            "cwe_ids": cwes, "fixed": fixed}
