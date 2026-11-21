@@ -328,16 +328,108 @@ def osv_enrich(
                 if data:
                     vuln_details[vid] = data
 
-    # 5. Resolve each tuple → list of full vuln records
+    # 5. Resolve each tuple → list of full vuln records, one per distinct bug
+    #    (the same bug published by two databases — GHSA + PYSEC, GHSA + GO —
+    #    is merged into one record; see merge_alias_duplicates).
     tuple_to_vulns: dict[tuple, list[dict]] = {}
     for tup, ids in tuple_ids.items():
         if not ids:
             continue
         records = [vuln_details[i] for i in ids if i in vuln_details]
         if records:
-            tuple_to_vulns[tup] = records
+            tuple_to_vulns[tup] = merge_alias_duplicates(records, tup[0])
 
     return tuple_to_vulns
+
+
+
+# Which database's record represents a merged bug. MAL- first (the malicious
+# signal keys on it), then the ecosystem's own database for Go (GO- records
+# carry the vulnerable symbols Level 2 reads), then GHSA (CVSS + CWEs), then
+# the rest in a stable order.
+def _primary_rank(vuln_id: str, ecosystem: str) -> tuple[int, str]:
+    prefix = vuln_id.split("-", 1)[0].upper()
+    if prefix == "MAL":
+        return (0, vuln_id)
+    if ecosystem == "Go" and prefix == "GO":
+        return (1, vuln_id)
+    if prefix == "GHSA":
+        return (2, vuln_id)
+    return (3, vuln_id)
+
+
+def merge_alias_duplicates(records: list[dict], ecosystem: str) -> list[dict]:
+    """One record per distinct bug.
+
+    WHY: OSV returns every database's advisory for a package version, and
+    several databases publish the SAME bug under their own id (GitHub's GHSA-,
+    PyPA's PYSEC-, Go's GO-), cross-referenced through `aliases`. Reported
+    as-is, each bug became two findings (20% of all findings on the
+    evaluation repos). Records that share any id — their own or an alias —
+    are the same bug and merge into one.
+
+    The merged record is a copy of the primary (_primary_rank) with:
+      * aliases = every other id + alias of the group (so a search for any of
+        them still finds the finding),
+      * severity / summary / details / database_specific.cwe_ids filled from
+        another member when the primary lacks them,
+      * affected = the union of every member's ranges (fix versions read the
+        finding's own package from it).
+    Input records are never mutated. Pure.
+    """
+    if len(records) < 2:
+        return list(records)
+    ids_of = [{r.get("id", "")} | set(r.get("aliases") or []) for r in records]
+    ids_of = [{i for i in ids if i} for ids in ids_of]
+    parent = list(range(len(records)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    owner: dict[str, int] = {}
+    for i, ids in enumerate(ids_of):
+        for x in ids:
+            if x in owner:
+                parent[find(i)] = find(owner[x])
+            else:
+                owner[x] = i
+    groups: dict[int, list[int]] = {}
+    for i in range(len(records)):
+        groups.setdefault(find(i), []).append(i)
+
+    out: list[dict] = []
+    for members in groups.values():
+        if len(members) == 1:
+            out.append(records[members[0]])
+            continue
+        members.sort(key=lambda i: _primary_rank(records[i].get("id", ""), ecosystem))
+        primary = records[members[0]]
+        merged = dict(primary)
+        others = [records[i] for i in members[1:]]
+        all_ids = set().union(*(ids_of[i] for i in members))
+        merged["aliases"] = sorted(all_ids - {primary.get("id", "")})
+        for key in ("severity", "summary", "details"):
+            if not merged.get(key):
+                for o in others:
+                    if o.get(key):
+                        merged[key] = o[key]
+                        break
+        cwes: list[str] = []
+        for r in [primary, *others]:
+            for c in (r.get("database_specific") or {}).get("cwe_ids") or []:
+                if c not in cwes:
+                    cwes.append(c)
+        if cwes:
+            merged["database_specific"] = {**(primary.get("database_specific") or {}), "cwe_ids": cwes}
+        affected = list(primary.get("affected") or [])
+        for o in others:
+            affected.extend(o.get("affected") or [])
+        merged["affected"] = affected
+        out.append(merged)
+    return out
 
 
 def _check_kev(vuln_id: str, aliases: str, kev_cve_set: set[str]) -> str:
