@@ -227,3 +227,8 @@ def test_imprecise_versions_report_only_whole_line_cves():
         by_ver.setdefault(r["version"], set()).add(r["vuln_id"])
     assert by_ver["1.20.0"] == {"CVE-WHOLE-LINE", "EOL-go-1.20"}       # patched-on-line CVE dropped
     assert by_ver["1.20.3"] == {"CVE-PATCHED", "CVE-WHOLE-LINE", "EOL-go-1.20"}   # exact keeps all
+
+
+def test_registry_suse_is_a_public_registry_with_its_own_auth_host():
+    from dkatchr.config import PUBLIC_IMAGE_REGISTRIES
+    assert PUBLIC_IMAGE_REGISTRIES["registry.suse.com"]["auth"] == ("scc.suse.com",)

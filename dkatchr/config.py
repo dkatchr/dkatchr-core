@@ -636,6 +636,9 @@ PUBLIC_IMAGE_REGISTRIES: dict[str, dict] = {
     "gcr.io":            {"api": "gcr.io", "auth": ("gcr.io",)},
     "registry.k8s.io":   {"api": "registry.k8s.io", "auth": ("registry.k8s.io",)},
     "public.ecr.aws":    {"api": "public.ecr.aws", "auth": ("public.ecr.aws",)},
+    # SUSE Linux Enterprise / BCI base images; anonymous tokens from SUSE's
+    # own auth host.
+    "registry.suse.com": {"api": "registry.suse.com", "auth": ("scc.suse.com",)},
 }
 IMAGE_REGISTRY_RATE_LIMIT_BACKOFF = 900   # seconds to stop calling a registry after HTTP 429
 # Inventory ecosystems produced by runtime scanning, and the vuln_id prefix of
