@@ -17,7 +17,11 @@ yields the runtime(s) the image ships and its Linux distribution:
 runtime_findings(): Runtime / OS rows -> finding rows (source "RUNTIME"):
   * one row per advisory from the injected advisory lookup (OSV + CVE.org +
     NVD, see dkatchr.clients.runtime_advisories), fix_versions = the fixes
-    newer than the version;
+    newer than the version. For an IMPRECISE version (version_source
+    "minimum": go.mod "go 1.20", Java "11", CI "3.10") only advisories that no
+    patch on that release line fixes are reported — a patch-level fix would
+    already be in whatever patch is installed; a spec coarser than a release
+    line ("3.x" for Python) reports nothing;
   * an end-of-life finding (vuln_id "EOL-{runtime}-{cycle}", severity HIGH)
     when the release line is past its end-of-life date — not for open ranges
     (">=3.9" names no line); every row of an end-of-life version carries
@@ -63,17 +67,18 @@ def expand_image_runtimes(inventory: list[dict], resolve=None) -> list[dict]:
         env = (info or {}).get("env") or {}
         found = False
         for rt, d in RUNTIMES.items():
-            version = source = kind = None
+            version = source = kind = precision = None
             for var in d["env"]:
                 if env.get(var):
                     p = parse_spec(env[var])
                     if p:
-                        version, source, kind = p[0], "resolved_tag", "exact"
+                        version, source, kind, precision = p[0], "resolved_tag", "exact", 3
                         break
             if version is None and short in d["images"] and not reference.startswith("sha256:"):
                 p = parse_spec(reference)
                 if p:
-                    version, source, kind = p[0], "minimum", ("exact" if p[2] == "exact" else "line")
+                    version, source, kind, precision = (p[0], "minimum",
+                                                        "exact" if p[2] == "exact" else "line", p[3])
                     if p[1] == "exact":
                         source = "exact"
             if version is None:
@@ -85,7 +90,8 @@ def expand_image_runtimes(inventory: list[dict], resolve=None) -> list[dict]:
             seen.add(key)
             r = {"file": row["file"], "ecosystem": "Runtime", "package": rt, "version": version,
                  "version_source": source, "origin": "registry", "spec": row.get("image", ""),
-                 "spec_kind": kind, "line": row.get("line"), "image": row.get("image")}
+                 "spec_kind": kind, "precision": precision, "line": row.get("line"),
+                 "image": row.get("image")}
             if build and not d.get("bakes_stdlib"):
                 r["scope"] = "dev"
             out.append(r)
@@ -128,6 +134,14 @@ def _cycle_for(cycles: list[dict], version: str) -> dict | None:
     return best
 
 
+def _line_granularity(cycles: list[dict]) -> int:
+    """How many numeric components name a release line (Node "22" -> 1,
+    Python "3.12" -> 2), from the product's own cycles."""
+    counts = [len(str(c.get("cycle", "")).split(".")) for c in cycles or []
+              if re.fullmatch(r"\d+(?:\.\d+)*", str(c.get("cycle", "")))]
+    return max(set(counts), key=counts.count) if counts else 1
+
+
 def _eol_date(cycle: dict, today: date) -> str | None:
     e = cycle.get("eol")
     if e is True:
@@ -166,6 +180,12 @@ def runtime_findings(repo_full_name: str, inventory: list[dict], advisories, eol
                 cycles = eol_cycles(product)
             except Exception:  # noqa: BLE001
                 cycles = None
+        # A spec less precise than the runtime's release lines ("3.x" for
+        # Python, whose lines are 3.12 / 3.13) names no line: nothing
+        # meaningful to report — its "lowest version" would be 3.0.0.
+        if (eco == "Runtime" and cycles and dep.get("version_source") == "minimum"
+                and dep.get("precision") and dep["precision"] < _line_granularity(cycles)):
+            continue
         cycle = _cycle_for(cycles, version) if cycles else None
         eol = _eol_date(cycle, today) if cycle else None
         extra = {"line": dep.get("line"), "spec": dep.get("spec", ""), "image": dep.get("image") or "",
@@ -177,8 +197,16 @@ def runtime_findings(repo_full_name: str, inventory: list[dict], advisories, eol
             except Exception:  # noqa: BLE001
                 advs = []
             vk = version_key(version)
+            imprecise = dep.get("version_source") == "minimum"
+            gran = _line_granularity(cycles) if cycles else (1 if name in ("node", "java") else 2)
+            line = ".".join(version.split(".")[:gran])
             for a in advs:
                 fixes = sorted({f for f in a.get("fixed") or [] if version_key(f) > vk}, key=version_key)
+                # Imprecise version (go.mod "go 1.20", Java "11", CI "3.10"):
+                # only CVEs NO patch on that release line fixes — those hit
+                # whatever patch is actually installed (decided 2026-11-22).
+                if imprecise and any(f == line or f.startswith(line + ".") for f in fixes):
+                    continue
                 row = empty_row(repo_full_name, dep)
                 aliases = ",".join(a.get("aliases") or [])
                 row.update({

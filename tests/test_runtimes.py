@@ -17,13 +17,14 @@ def _pv(rows):
 # ---- specs + file selection ----------------------------------------------------------
 
 def test_parse_spec():
-    assert parse_spec("3.2.2") == ("3.2.2", "exact", "exact")
-    assert parse_spec("v18.17.0") == ("18.17.0", "exact", "exact")
-    assert parse_spec("18") == ("18.0.0", "minimum", "line")
-    assert parse_spec("~> 3.2") == ("3.2.0", "minimum", "line")
-    assert parse_spec(">=3.9") == ("3.9.0", "minimum", "range")
-    assert parse_spec("1.8") == ("8.0.0", "minimum", "line")            # Java 8
-    assert parse_spec("17.0.9+9") == ("17.0.9", "exact", "exact")
+    assert parse_spec("3.2.2") == ("3.2.2", "exact", "exact", 3)
+    assert parse_spec("v18.17.0") == ("18.17.0", "exact", "exact", 3)
+    assert parse_spec("18") == ("18.0.0", "minimum", "line", 1)
+    assert parse_spec("~> 3.2") == ("3.2.0", "minimum", "line", 2)
+    assert parse_spec(">=3.9") == ("3.9.0", "minimum", "range", 2)
+    assert parse_spec("1.8") == ("8.0.0", "minimum", "line", 1)         # Java 8
+    assert parse_spec("17.0.9+9") == ("17.0.9", "exact", "exact", 3)
+    assert parse_spec("3.x") == ("3.0.0", "minimum", "line", 1)
     for none in ("lts/*", "stable", "<4", "${{ matrix.node }}", "system"):
         assert parse_spec(none) is None
 
@@ -187,3 +188,42 @@ def test_token_realm_must_be_the_registry_auth_host():
     assert ImageTagResolver._anonymous_token(evil, ("auth.docker.io",)) is None
     other = 'Bearer realm="https://attacker.example/token",service="x"'
     assert ImageTagResolver._anonymous_token(other, ("auth.docker.io",)) is None
+
+
+def test_vendored_third_party_files_are_not_the_repos_runtime():
+    assert not is_runtime_source(".github/actions/x/node_modules/tunnel/package.json")
+    assert not is_runtime_source("vendor/github.com/foo/bar/go.mod")
+    assert is_runtime_source("web/package.json")
+
+
+def test_spec_coarser_than_a_release_line_reports_nothing():
+    inv = [{"file": "ci.yml", "ecosystem": "Runtime", "package": "python", "version": "3.0.0",
+            "version_source": "minimum", "spec": "3.x", "spec_kind": "line", "precision": 1},
+           {"file": ".nvmrc", "ecosystem": "Runtime", "package": "node", "version": "18.0.0",
+            "version_source": "minimum", "spec": "18", "spec_kind": "line", "precision": 1}]
+    py = [{"cycle": "3.12", "eol": "2028-10-31", "latest": "3.12.8"},
+          {"cycle": "3.0", "eol": "2009-06-27", "latest": "3.0.1"}]
+    node = [{"cycle": "22", "eol": "2027-04-30", "latest": "22.11.0"},
+            {"cycle": "18", "eol": "2025-04-30", "latest": "18.20.5"}]
+    adv = lambda rt, v: [{"id": "CVE-X", "aliases": [], "fixed": ["99"], "cwe_ids": []}]
+    rows = runtime_findings("o/r", inv, adv, lambda p: py if p == "python" else node,
+                            today=date(2026, 11, 22))
+    assert {r["package"] for r in rows} == {"node"}            # "3.x" names no Python line
+    assert "EOL-node-18" in {r["vuln_id"] for r in rows}        # "18" IS a Node line
+
+
+def test_imprecise_versions_report_only_whole_line_cves():
+    inv = [{"file": "go.mod", "ecosystem": "Runtime", "package": "go", "version": "1.20.0",
+            "version_source": "minimum", "spec": "1.20", "spec_kind": "line", "precision": 2},
+           {"file": ".go-version", "ecosystem": "Runtime", "package": "go", "version": "1.20.3",
+            "version_source": "exact", "spec": "1.20.3", "spec_kind": "exact", "precision": 3}]
+    cycles = [{"cycle": "1.24", "eol": False, "latest": "1.24.5"},
+              {"cycle": "1.20", "eol": "2024-02-06", "latest": "1.20.14"}]
+    advs = [{"id": "CVE-PATCHED", "aliases": [], "fixed": ["1.20.5", "1.21.1"], "cwe_ids": []},
+            {"id": "CVE-WHOLE-LINE", "aliases": [], "fixed": ["1.22.0"], "cwe_ids": []}]
+    rows = runtime_findings("o/r", inv, lambda rt, v: advs, lambda p: cycles, today=date(2026, 11, 22))
+    by_ver = {}
+    for r in rows:
+        by_ver.setdefault(r["version"], set()).add(r["vuln_id"])
+    assert by_ver["1.20.0"] == {"CVE-WHOLE-LINE", "EOL-go-1.20"}       # patched-on-line CVE dropped
+    assert by_ver["1.20.3"] == {"CVE-PATCHED", "CVE-WHOLE-LINE", "EOL-go-1.20"}   # exact keeps all

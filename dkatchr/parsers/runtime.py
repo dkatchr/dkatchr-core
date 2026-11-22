@@ -55,8 +55,17 @@ _PROJECT = (".csproj", ".fsproj", ".vbproj")
 
 # ---- file selection -----------------------------------------------------------
 
+# Third-party code vendored into the repo: a dependency's package.json
+# `engines` or go.mod `go` line says what THAT library supports, not what this
+# repo runs on.
+_THIRD_PARTY_DIRS = {"node_modules", "vendor", "bower_components", "site-packages", ".venv",
+                     "venv", "third_party", "third-party", "jspm_packages", ".bundle"}
+
+
 def is_runtime_source(path: str) -> bool:
     """True when this repo path can name a runtime version or a container image."""
+    if _THIRD_PARTY_DIRS & set(path.split("/")[:-1]):
+        return False
     base = os.path.basename(path)
     if base in RUNTIME_VERSION_FILES or base.endswith(_PROJECT):
         return True
@@ -76,8 +85,9 @@ def is_runtime_source(path: str) -> bool:
 # ---- version specs ------------------------------------------------------------
 
 def parse_spec(spec: str) -> tuple[str, str, str] | None:
-    """(version, version_source, spec_kind) for a version spec, or None when it
-    names no concrete version (lts/*, stable, latest, system, a template)."""
+    """(version, version_source, spec_kind, precision) for a version spec, or None
+    when it names no concrete version (lts/*, stable, latest, system, a
+    template). precision = numeric components given ("3.x" -> 1, "3.12" -> 2)."""
     s = (spec or "").strip().strip("'\"").strip()
     if not s or "${" in s or "{{" in s:
         return None
@@ -93,25 +103,27 @@ def parse_spec(spec: str) -> tuple[str, str, str] | None:
     if not m:
         return None
     major, minor, patch = m.group(1), m.group(2), m.group(3)
+    precision = 1 + (minor is not None) + (patch is not None)
     prefix = low[:m.start()].strip()
     exact = (patch is not None and prefix in ("", "=", "==") and not re.search(r"\.[x*]", low))
     version = ".".join([major, minor or "0", patch or "0"])
     # Java's 1.8 notation is Java 8.
     if major == "1" and minor in ("5", "6", "7", "8") and not exact:
         version = f"{minor}.0.0"
+        precision = 1
     if exact:
-        return version, "exact", "exact"
-    return version, "minimum", ("range" if is_range else "line")
+        return version, "exact", "exact", precision
+    return version, "minimum", ("range" if is_range else "line"), precision
 
 
 def _row(path, runtime, spec, line, scope=None, **extra) -> dict | None:
     p = parse_spec(spec)
     if not p or runtime not in RUNTIMES:
         return None
-    version, source, kind = p
+    version, source, kind, precision = p
     row = {"file": path, "ecosystem": "Runtime", "package": runtime, "version": version,
            "version_source": source, "origin": "registry", "spec": str(spec).strip().strip("'\""),
-           "spec_kind": kind, "line": line}
+           "spec_kind": kind, "precision": precision, "line": line}
     if scope == "dev":
         row["scope"] = "dev"
     row.update(extra)
@@ -348,7 +360,7 @@ def _dispatch(path: str, base: str, content: str) -> list[dict]:
         rows = _json_rows(path, "dotnet", content, ("sdk", "version"), '"version"')
         for r in rows:
             r.update(version=".".join(r["version"].split(".")[:2]) + ".0",
-                     version_source="minimum", spec_kind="line")
+                     version_source="minimum", spec_kind="line", precision=2)
         return rows
     if base == "Gemfile":
         return _search(path, "ruby", content, r"^\s*ruby\s+[\"']([^\"']+)[\"']")
