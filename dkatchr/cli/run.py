@@ -13,6 +13,7 @@ vs WebSocket).
 """
 
 import json
+import os
 import re
 import sys
 import threading
@@ -70,8 +71,12 @@ def run_cli(args) -> None:
     if not getattr(args, "no_transitive", False):
         from dkatchr.clients.transitive_resolver import TransitiveResolver
         transitive = TransitiveResolver(cache_dir=args.cache_dir)
+    image_resolver = None
+    if not getattr(args, "no_runtimes", False):
+        from dkatchr.clients.image_tags import ImageTagResolver
+        image_resolver = ImageTagResolver(cache_dir=args.cache_dir)
     scanner  = Scanner(github=github, cache=cache, package_config=rules,
-                       transitive_resolver=transitive)
+                       transitive_resolver=transitive, image_resolver=image_resolver)
 
     # ---- resolve targets ------------------------------------------------
     repo_specs, orgs = _resolve_targets(github, args)
@@ -193,6 +198,13 @@ def run_cli(args) -> None:
                 if kev_cve_set is not None:
                     log(f"[✓] KEV: {totals['kev_hits']} finding(s) are known exploited vulnerabilities")
                 _print_exploit_intel_lines(args, totals)
+
+        # ---- runtime pass -----------------------------------------------
+        # Language runtimes + base images (version files, Dockerfiles, k8s,
+        # CI): CVEs from OSV + CVE.org + NVD, and end-of-life release lines.
+        # Not gated on --osv (its own data sources); --no-runtimes disables.
+        if not getattr(args, "no_runtimes", False) and per_repo_inventory:
+            _runtime_pass(args, writer, per_repo_inventory, kev_cve_set, totals)
 
         # ---- dependency-confusion pass ----------------------------------
         # Runs after the OSV pass (mirrors the web runner's ordering) but is
@@ -835,7 +847,8 @@ def _scan_batch(
 
             # Inventory feeds the OSV pass, the confusion pass, the typosquat
             # pass AND the dependency graph — collect it when any is active.
-            if args.osv or not args.no_confusion or args.typosquat or args.reachability:
+            if (args.osv or not args.no_confusion or args.typosquat or args.reachability
+                    or not getattr(args, "no_runtimes", False)):
                 with inventory_lock:
                     per_repo_inventory[full_name] = result["inventory"]
 
@@ -852,3 +865,47 @@ def _scan_batch(
 
         if bar:
             bar.close()
+
+
+def _runtime_pass(args, writer, per_repo_inventory: dict, kev_cve_set, totals: dict) -> None:
+    """Runtime / base-image findings, written straight to the CSV (they have
+    no reachability / attribution columns to fill)."""
+    from datetime import date
+
+    from dkatchr.clients.cvelist import CveListIndex
+    from dkatchr.clients.endoflife import EndOfLifeClient
+    from dkatchr.clients.nvd import NVDClient
+    from dkatchr.clients.runtime_advisories import RuntimeAdvisoryClient
+    from dkatchr.core.runtime_inventory import runtime_findings
+    from dkatchr.output.schema import RESULT_FIELDS
+
+    if not any(r.get("ecosystem") in ("Runtime", "OS")
+               for inv in per_repo_inventory.values() for r in inv):
+        return
+    log("\n===== RUNTIMES & BASE IMAGES =====")
+    cvelist = None
+    if not getattr(args, "no_cve_list", False):
+        cvelist = CveListIndex(cache_dir=args.cache_dir)
+        if not cvelist.sync(on_progress=lambda p: None):
+            log("[!] CVE.org index unavailable — runtime CVEs from OSV + NVD only")
+            cvelist = None
+    osv = OSVClient(cache_dir=f"{args.cache_dir}/osv", ttl_seconds=args.osv_ttl,
+                    rps=args.osv_rps, burst=args.osv_burst)
+    nvd = NVDClient(cache_dir=args.cache_dir, api_key=os.environ.get("NVD_API_KEY") or None)
+    advisories = RuntimeAdvisoryClient(osv_client=osv, cvelist=cvelist, nvd_client=nvd)
+    eol = EndOfLifeClient(cache_dir=args.cache_dir)
+    n = 0
+    for full_name, inv in per_repo_inventory.items():
+        try:
+            rows = runtime_findings(full_name, inv, advisories.get, eol.get_cycles,
+                                    today=date.today(), kev_cve_set=kev_cve_set)
+        except Exception as e:
+            log(f"[!] {full_name}: runtime findings failed: {e}")
+            continue
+        for row in rows:
+            _finalize_finding_row(row, set(), set())
+        writer.write_rows([{k: r.get(k, "") for k in RESULT_FIELDS} for r in rows])
+        n += len(rows)
+    osv.save_index()
+    totals["runtime_hits"] = n
+    log(f"[✓] Runtimes: wrote {n} runtime / base-image finding(s)")

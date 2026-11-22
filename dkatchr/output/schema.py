@@ -48,6 +48,9 @@ RESULT_FIELDS = [
     # "dev" when every manifest occurrence marks the dependency development/
     # test-only (devDependencies, packages-dev, test scope, …); empty otherwise.
     "scope",
+    # Runtime scanning (additive): end-of-life date of the runtime / OS
+    # release line ("past" when only flagged without a date), empty otherwise.
+    "eol_date",
 ]
 
 

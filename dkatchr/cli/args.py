@@ -74,6 +74,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Run Level 1 reachability analysis after vulnerability detection. "
                         "Uses GitHub Code Search API (~1s per unique vulnerable package). "
                         "Requires GITHUB_TOKEN (already required for scanning).")
+    p.add_argument("--no-runtimes", action="store_true",
+                   help="Do not report language-runtime / base-image vulnerabilities and "
+                        "end-of-life (Ruby, Node, Python, Go, Java, .NET, PHP, Rust, Elixir, Erlang "
+                        "from version files, Dockerfiles, compose/k8s/Helm and CI workflows)")
+    p.add_argument("--no-cve-list", action="store_true",
+                   help="Runtime scanning without the local CVE.org index (skips its one-time "
+                        "~640 MB download; recent runtime CVEs NVD has not analysed are then missed)")
     p.add_argument("--no-transitive", action="store_true",
                    help="Do not resolve the dependencies of lockfile-less manifests (pom.xml, "
                         ".csproj, top-level requirements.txt) via deps.dev / the NuGet registry")

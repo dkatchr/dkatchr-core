@@ -70,7 +70,7 @@ ATTRIBUTION_CACHE_SCHEMA: int = 1
 #      sub-projects), `pinned` on requirements `==` rows.
 # v11: dev scope propagated through yarn.lock / pnpm-lock / Gemfile.lock edges;
 #      Gemfile.lock DEPENDENCIES rows flagged `direct`.
-CACHE_SCHEMA = 11
+CACHE_SCHEMA = 13   # v13: runtime rows skip vendored dirs, carry spec precision
 
 # Bundler group names that mean "not installed in production" — the
 # conventional names (`bundle config set without development test`), not a
@@ -544,3 +544,130 @@ TRANSITIVE_NUGET_MAX_NODES = int(os.environ.get("DKATCHR_TRANSITIVE_NUGET_MAX_NO
 # that repo and reachability falls back to plain import presence.
 GRAPH_MAX_META_LOOKUPS   = int(os.environ.get("DKATCHR_GRAPH_MAX_META_LOOKUPS", "800"))
 GRAPH_MAX_PROBE_PACKAGES = int(os.environ.get("DKATCHR_GRAPH_MAX_PROBE_PACKAGES", "600"))
+
+
+# ---------------------------------------------------------------------------
+# Runtime & base-image scanning (dkatchr>=0.8.0)
+# ---------------------------------------------------------------------------
+# Identity facts about each language RUNTIME — the same constant class as
+# DEFAULT_PUBLIC_REGISTRY_HOSTS / the PURL type map: what each runtime is
+# called by each data source, never per-package domain data.
+#   osv          (ecosystem, package) pairs whose OSV advisories cover the runtime
+#   cpe          NVD CPE vendor:product (version-aware virtualMatchString queries)
+#   cve_products (vendor, product) names CNAs use in CVE.org "affected" entries
+#                (matched case-insensitively)
+#   eol          endoflife.date product slug
+#   images       official image repository names that ship this runtime
+#   env          image ENV variables that carry the runtime version
+#   asdf         .tool-versions / CI tool names
+#   cve_listed_is_max  the CNA lists the highest affected version per line
+#                (plain "version" entries mean "this and older on that line")
+#   bakes_stdlib the toolchain compiles its standard library INTO the shipped
+#                binary, so a build-stage version still ships
+RUNTIMES: dict[str, dict] = {
+    "ruby":   {"osv": [("Bitnami", "ruby")], "cpe": "ruby-lang:ruby",
+               "cve_products": [("ruby-lang", "ruby"), ("ruby", "ruby")], "eol": "ruby",
+               "images": ["ruby"], "env": ["RUBY_VERSION"], "asdf": ["ruby"], "bakes_stdlib": False},
+    "node":   {"osv": [("Bitnami", "node")], "cpe": "nodejs:node.js",
+               "cve_products": [("nodejs", "node"), ("nodejs", "node.js"), ("node.js", "node.js")],
+               "eol": "nodejs", "images": ["node"], "env": ["NODE_VERSION"],
+               "asdf": ["nodejs", "node"], "bakes_stdlib": False},
+    "python": {"osv": [("Bitnami", "python")], "cpe": "python:python",
+               "cve_products": [("python software foundation", "cpython"), ("python", "python"),
+                                ("python", "cpython")], "eol": "python",
+               "images": ["python"], "env": ["PYTHON_VERSION"], "asdf": ["python"], "bakes_stdlib": False},
+    "php":    {"osv": [("Bitnami", "php")], "cpe": "php:php",
+               "cve_products": [("php group", "php"), ("php", "php")], "eol": "php",
+               "images": ["php"], "env": ["PHP_VERSION"], "asdf": ["php"], "bakes_stdlib": False},
+    "go":     {"osv": [("Go", "stdlib"), ("Go", "toolchain")], "cpe": "golang:go",
+               "cve_products": [("go standard library", "*"), ("go toolchain", "*"), ("golang", "go")],
+               "eol": "go", "images": ["golang"], "env": ["GOLANG_VERSION"],
+               "asdf": ["golang", "go"], "bakes_stdlib": True},
+    "java":   {"osv": [("Bitnami", "java")], "cpe": "oracle:openjdk",
+               "cve_products": [("oracle", "java se*"), ("oracle corporation", "java se*"),
+                                ("oracle corporation", "oracle java se*"),
+                                ("oracle", "openjdk"), ("eclipse foundation", "temurin")],
+               # Oracle's CVE records list the HIGHEST affected version per
+               # release line ("17.0.14" = 17.0.14 and earlier on 17).
+               "cve_listed_is_max": True,
+               "eol": "eclipse-temurin",
+               "images": ["eclipse-temurin", "openjdk", "amazoncorretto", "ibm-semeru-runtimes", "sapmachine"],
+               "env": ["JAVA_VERSION"], "asdf": ["java"], "bakes_stdlib": False},
+    "dotnet": {"osv": [("Bitnami", "dotnet"), ("Bitnami", "aspnet-core")], "cpe": "microsoft:.net",
+               "cve_products": [("microsoft", ".net*"), ("microsoft", "asp.net core*")],
+               "cve_exclude": ["framework"],
+               "eol": "dotnet",
+               "images": ["dotnet/runtime", "dotnet/aspnet", "dotnet/sdk", "dotnet/runtime-deps"],
+               "env": ["DOTNET_VERSION", "ASPNET_VERSION"], "asdf": ["dotnet", "dotnet-core"],
+               "bakes_stdlib": False},
+    "rust":   {"osv": [], "cpe": "rust-lang:rust", "cve_products": [("rust-lang", "rust")],
+               "eol": "rust", "images": ["rust"], "env": ["RUST_VERSION"], "asdf": ["rust"],
+               "bakes_stdlib": True},
+    "elixir": {"osv": [], "cpe": "elixir-lang:elixir",
+               "cve_products": [("elixir-lang", "elixir"), ("elixir", "elixir")], "eol": "elixir",
+               "images": ["elixir"], "env": ["ELIXIR_VERSION"], "asdf": ["elixir"], "bakes_stdlib": False},
+    "erlang": {"osv": [], "cpe": "erlang:erlang\\/otp",
+               "cve_products": [("erlang", "otp"), ("erlang", "erlang/otp")], "eol": "erlang",
+               "images": ["erlang"], "env": ["OTP_VERSION"], "asdf": ["erlang"], "bakes_stdlib": False},
+}
+
+# Linux base-image distributions: endoflife.date slug per image repository.
+DISTRO_EOL_PRODUCTS: dict[str, str] = {
+    "debian": "debian", "ubuntu": "ubuntu", "alpine": "alpine-linux",
+}
+
+ENDOFLIFE_API_URL = os.environ.get("DKATCHR_ENDOFLIFE_URL", "https://endoflife.date/api/{product}.json")
+DEFAULT_ENDOFLIFE_TTL = int(os.environ.get("DKATCHR_ENDOFLIFE_TTL", str(7 * 24 * 3600)))
+ENDOFLIFE_TIMEOUT = 20
+
+# Public registries whose images resolve anonymously (docker.io is the
+# default when an image reference names no registry).
+IMAGE_REGISTRY_DEFAULT = "docker.io"
+# Only these PUBLIC registries are ever contacted to resolve an image tag, over
+# https, and a token realm must be one of the registry's own auth hosts. Any
+# other host named in a repo's Dockerfile / manifest (a private or internal
+# registry) is never contacted — it is a repo-controlled URL (SSRF). Private
+# registries arrive with stored credentials in release C.
+PUBLIC_IMAGE_REGISTRIES: dict[str, dict] = {
+    "docker.io":         {"api": "registry-1.docker.io", "auth": ("auth.docker.io",)},
+    "ghcr.io":           {"api": "ghcr.io", "auth": ("ghcr.io",)},
+    "quay.io":           {"api": "quay.io", "auth": ("quay.io",)},
+    "mcr.microsoft.com": {"api": "mcr.microsoft.com", "auth": ("mcr.microsoft.com",)},
+    "gcr.io":            {"api": "gcr.io", "auth": ("gcr.io",)},
+    "registry.k8s.io":   {"api": "registry.k8s.io", "auth": ("registry.k8s.io",)},
+    "public.ecr.aws":    {"api": "public.ecr.aws", "auth": ("public.ecr.aws",)},
+}
+IMAGE_REGISTRY_RATE_LIMIT_BACKOFF = 900   # seconds to stop calling a registry after HTTP 429
+# Inventory ecosystems produced by runtime scanning, and the vuln_id prefix of
+# end-of-life findings — shared by dkatchr-core and dkatchr-web.
+RUNTIME_ECOSYSTEMS = ("Runtime", "ContainerImage", "OS")
+EOL_VULN_PREFIX = "EOL-"
+DEFAULT_IMAGE_TAG_TTL = int(os.environ.get("DKATCHR_IMAGE_TAG_TTL", str(24 * 3600)))
+IMAGE_REGISTRY_TIMEOUT = 20
+IMAGE_TAG_CACHE_SCHEMA = 1
+
+# Official CVE List (CVE.org, CVE JSON 5): runtime CVEs NVD has not analysed
+# yet carry their affected versions only here. One full baseline download,
+# then each day's delta release; a local index keeps runtime records only.
+CVELIST_RELEASES_API = "https://api.github.com/repos/CVEProject/cvelistV5/releases?per_page=100&page={page}"
+CVELIST_RECORD_URL = "https://cveawg.mitre.org/api/cve/{cve_id}"
+CVELIST_BASELINE_MAX_AGE_DAYS = int(os.environ.get("DKATCHR_CVELIST_BASELINE_MAX_AGE_DAYS", "25"))
+CVELIST_SYNC_TTL = int(os.environ.get("DKATCHR_CVELIST_SYNC_TTL", str(6 * 3600)))
+CVELIST_TIMEOUT = 120
+CVELIST_INDEX_SCHEMA = 2   # v2: Oracle 'Oracle Java SE' product + max-affected convention
+
+# NVD version-aware CPE lookups for runtimes (per runtime+version, TTL'd:
+# NVD analyses CVEs late, a re-check picks newly analysed ranges up).
+DEFAULT_NVD_CPE_TTL = int(os.environ.get("DKATCHR_NVD_CPE_TTL", str(24 * 3600)))
+
+# Files that can name a runtime version or a container image (see
+# dkatchr/parsers/runtime.py). YAML deployment manifests are only read when
+# their path looks like deployment config, to avoid pulling every YAML file.
+RUNTIME_VERSION_FILES = frozenset({
+    ".ruby-version", ".nvmrc", ".node-version", ".python-version", ".tool-versions",
+    ".java-version", ".sdkmanrc", "global.json", "rust-toolchain", "rust-toolchain.toml",
+    "mix.exs", "go.mod", "package.json", "Gemfile", "composer.json", "pyproject.toml",
+    "pom.xml", "build.gradle", "build.gradle.kts",
+})
+RUNTIME_DEPLOY_PATH_HINTS = ("k8s", "kube", "kubernetes", "helm", "chart", "deploy",
+                             "manifests", "argocd", "kustomize", "openshift")
