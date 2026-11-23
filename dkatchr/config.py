@@ -639,6 +639,12 @@ PUBLIC_IMAGE_REGISTRIES: dict[str, dict] = {
     # SUSE Linux Enterprise / BCI base images; anonymous tokens from SUSE's
     # own auth host.
     "registry.suse.com": {"api": "registry.suse.com", "auth": ("scc.suse.com",)},
+    # Elastic's public registry (Elasticsearch, Kibana, Beats ...); anonymous
+    # tokens from Elastic's own auth host.
+    "docker.elastic.co": {"api": "docker.elastic.co", "auth": ("docker-auth.elastic.co",)},
+    # The retired name of registry.k8s.io: it redirects every request there and
+    # serves the same image names, so it is read from registry.k8s.io directly.
+    "k8s.gcr.io":        {"api": "registry.k8s.io", "auth": ("registry.k8s.io",)},
 }
 IMAGE_REGISTRY_RATE_LIMIT_BACKOFF = 900   # seconds to stop calling a registry after HTTP 429
 # Inventory ecosystems produced by runtime scanning, and the vuln_id prefix of
@@ -647,6 +653,7 @@ RUNTIME_ECOSYSTEMS = ("Runtime", "ContainerImage", "OS")
 EOL_VULN_PREFIX = "EOL-"
 DEFAULT_IMAGE_TAG_TTL = int(os.environ.get("DKATCHR_IMAGE_TAG_TTL", str(24 * 3600)))
 IMAGE_REGISTRY_TIMEOUT = 20
+IMAGE_REGISTRY_MAX_REDIRECTS = 3   # manifest redirects (registry.k8s.io -> regional mirror) followed by hand
 IMAGE_TAG_CACHE_SCHEMA = 1
 
 # Official CVE List (CVE.org, CVE JSON 5): runtime CVEs NVD has not analysed

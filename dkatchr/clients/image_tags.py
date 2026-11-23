@@ -27,9 +27,11 @@ names (dkatchr.core.runtime_inventory reads config.RUNTIMES for that).
 """
 
 import hashlib
+import ipaddress
 import json
 import os
 import re
+import socket
 import time
 
 import requests
@@ -40,6 +42,7 @@ from urllib.parse import urlparse
 from dkatchr.config import (
     DEFAULT_IMAGE_TAG_TTL,
     DKATCHR_USER_AGENT,
+    IMAGE_REGISTRY_MAX_REDIRECTS,
     IMAGE_REGISTRY_RATE_LIMIT_BACKOFF,
     IMAGE_REGISTRY_TIMEOUT,
     IMAGE_TAG_CACHE_SCHEMA,
@@ -54,6 +57,24 @@ _ACCEPT = ", ".join([
     "application/vnd.docker.distribution.manifest.v2+json",
 ])
 _FAIL_TTL = 3600
+
+
+def _public_https(url: str) -> bool:
+    """A redirect target is followed only over https to a PUBLIC address —
+    never loopback / private / link-local (cloud metadata) networks."""
+    u = urlparse(url)
+    if u.scheme != "https" or not u.hostname:
+        return False
+    try:
+        infos = socket.getaddrinfo(u.hostname, u.port or 443, proto=socket.IPPROTO_TCP)
+    except OSError:
+        return False
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+                or ip.is_multicast or ip.is_unspecified):
+            return False
+    return True
 
 
 class ImageTagResolver:
@@ -103,6 +124,8 @@ class ImageTagResolver:
             self.limiter.acquire()
             resp = requests.get(url, headers=headers, timeout=IMAGE_REGISTRY_TIMEOUT,
                                 allow_redirects=False if "/manifests/" in url else True)
+            if "/manifests/" in url and resp.is_redirect:
+                return self._follow_redirect(resp, accept)
             if resp.status_code == 401 and not token_box.get("token"):
                 token = self._anonymous_token(resp.headers.get("WWW-Authenticate", ""), auth_hosts)
                 if not token:
@@ -110,6 +133,32 @@ class ImageTagResolver:
                 token_box["token"] = token
                 continue
             return resp
+        return None
+
+    def _follow_redirect(self, resp: requests.Response, accept: str) -> requests.Response | None:
+        """Follow a manifest redirect by hand (registry.k8s.io sends every
+        request to a regional mirror): at most IMAGE_REGISTRY_MAX_REDIRECTS
+        hops, each https to a PUBLIC address, no Authorization forwarded; a
+        token the mirror asks for must come from the mirror's OWN host."""
+        for _ in range(IMAGE_REGISTRY_MAX_REDIRECTS):
+            loc = resp.headers.get("Location", "")
+            if not _public_https(loc):
+                log("[!] image registry redirect to a non-public or non-https location — skipped")
+                return None
+            host = (urlparse(loc).hostname or "").lower()
+            headers = {"Accept": accept, "User-Agent": DKATCHR_USER_AGENT}
+            self.limiter.acquire()
+            resp = requests.get(loc, headers=headers, timeout=IMAGE_REGISTRY_TIMEOUT,
+                                allow_redirects=False)
+            if resp.status_code == 401:
+                token = self._anonymous_token(resp.headers.get("WWW-Authenticate", ""), (host,))
+                if not token:
+                    return resp
+                headers["Authorization"] = f"Bearer {token}"
+                resp = requests.get(loc, headers=headers, timeout=IMAGE_REGISTRY_TIMEOUT,
+                                    allow_redirects=False)
+            if not resp.is_redirect:
+                return resp
         return None
 
     @staticmethod
