@@ -281,3 +281,24 @@ def test_manifest_redirect_to_private_address_is_refused(tmp_path, monkeypatch):
     assert r._get("https://registry.k8s.io/v2/x/manifests/1", "application/json", {}, ()) is None
     assert image_tags._public_https("https://169.254.169.254/x") is False
     assert image_tags._public_https("http://registry.k8s.io/x") is False
+
+
+def test_yaml_schema_keys_are_not_images():
+    from dkatchr.parsers.runtime import _yaml_images
+    # A bare `repository:` / `image:` with a nested mapping below must not read
+    # the next line's KEY as an image (the CRD false positive: library/type).
+    crd = (
+        "kind: CustomResourceDefinition\n"
+        "spec:\n  versions:\n  - schema:\n      openAPIV3Schema:\n        properties:\n"
+        "          repository:\n            type: string\n"
+        "          image:\n            description: Image to run\n            type: string\n"
+    )
+    assert _yaml_images("crds.yaml", crd) == []
+    # An install bundle: the CRD document is skipped, the Deployment is not.
+    bundle = crd + "---\nkind: Deployment\nspec:\n  template:\n    spec:\n      containers:\n" \
+                   "      - name: op\n        image: ghcr.io/acme/operator:1.2.3\n"
+    assert [r["package"] for r in _yaml_images("bundle.yaml", bundle)] == ["ghcr.io/acme/operator"]
+    # Helm values still work.
+    vals = "image:\n  repository: bitnami/redis\n  tag: 7.2.4\n"
+    assert [(r["package"], r["version"]) for r in _yaml_images("values.yaml", vals)] == \
+        [("docker.io/bitnami/redis", "7.2.4")]
