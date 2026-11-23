@@ -232,3 +232,52 @@ def test_imprecise_versions_report_only_whole_line_cves():
 def test_registry_suse_is_a_public_registry_with_its_own_auth_host():
     from dkatchr.config import PUBLIC_IMAGE_REGISTRIES
     assert PUBLIC_IMAGE_REGISTRIES["registry.suse.com"]["auth"] == ("scc.suse.com",)
+
+
+def test_elastic_and_retired_k8s_gcr_are_public_registries():
+    from dkatchr.config import PUBLIC_IMAGE_REGISTRIES
+    assert PUBLIC_IMAGE_REGISTRIES["docker.elastic.co"]["auth"] == ("docker-auth.elastic.co",)
+    # k8s.gcr.io redirects every request to registry.k8s.io (same image names),
+    # so it is read from there and only that host's tokens are accepted.
+    assert PUBLIC_IMAGE_REGISTRIES["k8s.gcr.io"] == {"api": "registry.k8s.io", "auth": ("registry.k8s.io",)}
+
+
+class _Resp:
+    def __init__(self, status, headers=None, body=None):
+        self.status_code, self.headers, self._body = status, headers or {}, body or {}
+        self.is_redirect = status in (301, 302, 303, 307, 308)
+
+    def json(self):
+        return self._body
+
+
+def test_manifest_redirect_followed_by_hand_without_credentials(tmp_path, monkeypatch):
+    from dkatchr.clients import image_tags
+    calls = []
+
+    def fake_get(url, headers=None, **kw):
+        calls.append((url, dict(headers or {}), kw.get("allow_redirects")))
+        if url.startswith("https://registry.k8s.io/"):
+            return _Resp(307, {"Location": "https://mirror.example/v2/pause/manifests/3.9"})
+        return _Resp(200, {"Docker-Content-Digest": "sha256:abc"}, {})
+
+    monkeypatch.setattr(image_tags.requests, "get", fake_get)
+    monkeypatch.setattr(image_tags, "_public_https", lambda url: url.startswith("https://mirror.example/"))
+    r = image_tags.ImageTagResolver(str(tmp_path))
+    resp = r._get("https://registry.k8s.io/v2/pause/manifests/3.9", "application/json",
+                  {"token": "secret"}, ("registry.k8s.io",))
+    assert resp.status_code == 200
+    mirror_call = calls[-1]
+    assert mirror_call[0].startswith("https://mirror.example/")
+    assert "Authorization" not in mirror_call[1]          # the registry token never travels
+    assert all(c[2] is False for c in calls)             # never auto-followed
+
+
+def test_manifest_redirect_to_private_address_is_refused(tmp_path, monkeypatch):
+    from dkatchr.clients import image_tags
+    monkeypatch.setattr(image_tags.requests, "get",
+                        lambda url, **kw: _Resp(307, {"Location": "https://169.254.169.254/latest/"}))
+    r = image_tags.ImageTagResolver(str(tmp_path))
+    assert r._get("https://registry.k8s.io/v2/x/manifests/1", "application/json", {}, ()) is None
+    assert image_tags._public_https("https://169.254.169.254/x") is False
+    assert image_tags._public_https("http://registry.k8s.io/x") is False
