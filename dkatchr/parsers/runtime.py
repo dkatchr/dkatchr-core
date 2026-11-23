@@ -232,13 +232,18 @@ def _dockerfile(path: str, content: str) -> list[dict]:
     return rows
 
 
-_IMAGE_KEY = re.compile(r"^(\s*)-?\s*image:\s*[\"']?([^\s\"'#]+)[\"']?\s*(?:#.*)?$", re.M)
-_HELM_REPO = re.compile(r"^(\s*)repository:\s*[\"']?([^\s\"'#]+)", re.M)
-_HELM_TAG = re.compile(r"^\s*tag:\s*[\"']?([^\s\"'#]+)", re.M)
+# The value must sit on the SAME line as its key ([ \t]*, never \s*): a bare
+# `repository:` / `image:` with a nested mapping below it (a CRD schema, a Helm
+# values block) would otherwise read the next line's KEY as an image name.
+_IMAGE_KEY = re.compile(r"^([ \t]*)-?[ \t]*image:[ \t]*[\"']?([^\s\"'#]+)[\"']?[ \t]*(?:#.*)?$", re.M)
+_HELM_REPO = re.compile(r"^([ \t]*)repository:[ \t]*[\"']?([^\s\"'#]+)", re.M)
+_HELM_TAG = re.compile(r"^[ \t]*tag:[ \t]*[\"']?([^\s\"'#]+)", re.M)
+_CRD_KIND = re.compile(r"^kind:[ \t]*CustomResourceDefinition[ \t]*$", re.M)
 
 
 def _yaml_images(path: str, content: str) -> list[dict]:
     rows = []
+    crd_lines = _crd_line_ranges(content)
     for m in _IMAGE_KEY.finditer(content):
         val = m.group(2)
         if val in ("|", ">") or val.endswith(":"):
@@ -254,7 +259,26 @@ def _yaml_images(path: str, content: str) -> list[dict]:
         r = _image_row(path, ref, _line_of(content, m.start(2)))
         if r:
             rows.append(r)
+    if crd_lines:
+        rows = [r for r in rows if not any(a <= (r.get("line") or 0) <= b for a, b in crd_lines)]
     return rows
+
+
+def _crd_line_ranges(content: str) -> list[tuple[int, int]]:
+    """Line ranges of the CustomResourceDefinition documents in a YAML stream.
+    A CRD is an API schema: its `image` / `repository` entries describe fields,
+    they never name an image that is deployed (other documents in the same file
+    — an install bundle's Deployments — still count)."""
+    if not _CRD_KIND.search(content):
+        return []
+    ranges, start, lines = [], 1, content.splitlines()
+    bounds = [i + 1 for i, ln in enumerate(lines) if ln.startswith("---")] + [len(lines) + 1]
+    for end in bounds:
+        doc = "\n".join(lines[start - 1:end - 1])
+        if _CRD_KIND.search(doc):
+            ranges.append((start, end - 1))
+        start = end + 1
+    return ranges
 
 
 def _workflow(path: str, content: str) -> list[dict]:
