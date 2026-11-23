@@ -70,7 +70,7 @@ ATTRIBUTION_CACHE_SCHEMA: int = 1
 #      sub-projects), `pinned` on requirements `==` rows.
 # v11: dev scope propagated through yarn.lock / pnpm-lock / Gemfile.lock edges;
 #      Gemfile.lock DEPENDENCIES rows flagged `direct`.
-CACHE_SCHEMA = 14   # v13: runtime rows skip vendored dirs, carry spec precision
+CACHE_SCHEMA = 14   # v14: YAML image values same-line only, CRD documents skipped
 
 # Bundler group names that mean "not installed in production" — the
 # conventional names (`bundle config set without development test`), not a
