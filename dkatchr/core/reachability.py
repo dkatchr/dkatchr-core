@@ -23,6 +23,9 @@ ACCURACY NOTES:
   "the vulnerable artifact's package is imported".
 - Dynamic imports (Python importlib, JS dynamic import()) are not detected. These
   are a source of false negatives. Level 2 LLM analysis addresses this.
+- Committed third-party code (config.THIRD_PARTY_DIRS: node_modules/, Go vendor/,
+  ...) is never searched: its imports are not the repo's own use; transitive use
+  through it is the dependency graph's job.
 - Test files are excluded by default (configurable). A package used only in tests
   is labelled UNUSED with no evidence.
 - TRANSITIVE dependencies (dependency-graph reachability): pass a
@@ -57,6 +60,7 @@ import ahocorasick
 from dkatchr.clients.github import GitHubClient, TarballSizeExceeded
 from dkatchr.clients.resolvers import ImportNameResolver
 from dkatchr.config import (
+    THIRD_PARTY_DIRS,
     GRAPH_MAX_PROBE_PACKAGES,
     REACHABILITY_COMMAND_FILE_NAMES,
     REACHABILITY_COMMAND_FILE_PREFIXES,
@@ -127,6 +131,13 @@ def build_command_patterns(commands: list[str]) -> tuple[list[str], list[str]]:
 def _is_test_file(path: str) -> bool:
     lower = path.lower()
     return any(pat in lower for pat in REACHABILITY_TEST_FILE_PATTERNS)
+
+
+def _is_third_party(path: str) -> bool:
+    """True for files inside committed third-party code (node_modules/, vendor/ ...).
+
+    The first segment is the tarball's archive root and never counts."""
+    return bool(THIRD_PARTY_DIRS & set(path.split("/")[1:-1]))
 
 
 def _is_source_file(path: str) -> bool:
@@ -448,6 +459,11 @@ def _grep_tar_stream(
                     _tick()
                 continue
             in_manifest = bool(command_patterns) and _is_manifest_path(member.name)
+            if _is_third_party(member.name):
+                files_skipped += 1
+                if members_seen % REACHABILITY_SCAN_PROGRESS_EVERY == 0:
+                    _tick()
+                continue
             if exclude_test_files and _is_test_file(member.name):
                 files_skipped += 1
                 if members_seen % REACHABILITY_SCAN_PROGRESS_EVERY == 0:
