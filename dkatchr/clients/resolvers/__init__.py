@@ -41,6 +41,7 @@ from dkatchr.clients.resolvers.pypi import PyPIResolver
 from dkatchr.clients.resolvers.rubygems import RubyGemsResolver
 from dkatchr.config import (
     REGISTRY_RESOLVER_CACHE_SCHEMA,
+    REGISTRY_RESOLVER_ECOSYSTEM_SCHEMA,
     REGISTRY_RESOLVER_WORKERS,
 )
 from dkatchr.logger import log
@@ -279,6 +280,10 @@ class ImportNameResolver:
         safe_eco = re.sub(r"[^A-Za-z0-9._-]", "_", ecosystem)
         return os.path.join(self.cache_dir, f"{safe_eco}__{safe_pkg}.json")
 
+    def _schema(self, ecosystem: str) -> int:
+        """Cache schema for one ecosystem (per-ecosystem revisions win)."""
+        return REGISTRY_RESOLVER_ECOSYSTEM_SCHEMA.get(ecosystem, self.SCHEMA)
+
     def _cache_read(self, package: str, ecosystem: str) -> list[str] | None:
         path = self._cache_path(package, ecosystem)
         if not os.path.exists(path):
@@ -288,7 +293,7 @@ class ImportNameResolver:
                 data = json.load(f)
         except Exception:
             return None
-        if not isinstance(data, dict) or data.get("schema") != self.SCHEMA:
+        if not isinstance(data, dict) or data.get("schema") != self._schema(ecosystem):
             return None
         names = data.get("import_names")
         if not isinstance(names, list):
@@ -307,7 +312,7 @@ class ImportNameResolver:
         if not names:
             return
         payload = {
-            "schema":       self.SCHEMA,
+            "schema":       self._schema(ecosystem),
             "ecosystem":    ecosystem,
             "package":      package,
             "import_names": names,
@@ -345,7 +350,7 @@ class ImportNameResolver:
             try:
                 with open(path, encoding="utf-8") as f:
                     data = json.load(f)
-                if isinstance(data, dict) and data.get("schema") == self.SCHEMA:
+                if isinstance(data, dict) and data.get("schema") == self._schema(_normalize_ecosystem(ecosystem)):
                     cmds = [c for c in data.get("commands") or [] if isinstance(c, str) and c]
             except (OSError, ValueError):
                 pass

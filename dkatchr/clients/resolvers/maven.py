@@ -9,8 +9,12 @@ cannot return this — the only way to know is to inspect the JAR.
 
 Fast path: OSGi bundles declare exported packages in `META-INF/MANIFEST.MF`
 under `Export-Package`. When present this is authoritative and tiny to parse.
-Fallback: enumerate `.class` paths and take the first two segments as a
-package root.
+Fallback: enumerate `.class` paths and take each class's FULL package
+(`org/apache/parquet/avro/AvroReadSupport.class` -> `org.apache.parquet.avro`),
+then keep only the shallowest ones (`collapse_packages`). An earlier version cut
+every path to two segments, so parquet-avro resolved to `org.apache` and any file
+with `import org.apache.` counted as using it (89 of 90 class-path resolutions in
+a real tenant were that broad).
 
 Does NOT: descend into nested JARs (fat JARs / Spring Boot uber-JARs would
 require recursive unpacking; out of scope for Level 1).
@@ -64,7 +68,7 @@ class MavenResolver(RegistryResolverBase):
             # Fast path: MANIFEST.MF / Export-Package
             manifest_packages = _parse_export_package(zf, package)
             if manifest_packages:
-                return manifest_packages, "jar_manifest_export_package"
+                return collapse_packages(set(manifest_packages)), "jar_manifest_export_package"
 
             # Fallback: .class directory structure
             packages: set[str] = set()
@@ -73,10 +77,9 @@ class MavenResolver(RegistryResolverBase):
                 if not name.endswith(".class"):
                     continue
                 has_classes = True
-                # com/example/util/StringUtils.class → "com.example"
-                parts = name.split("/")
-                if len(parts) >= 2:
-                    packages.add(".".join(parts[:2]))
+                pkg = class_package(name)
+                if pkg:
+                    packages.add(pkg)
 
             if not has_classes:
                 log(f"[resolver] maven/{package}: parse error — jar contains no .class files")
@@ -86,7 +89,41 @@ class MavenResolver(RegistryResolverBase):
                 log(f"[resolver] maven/{package}: parse error — could not extract package paths")
                 return None
 
-            return sorted(packages), "jar_class_paths"
+            return collapse_packages(packages), "jar_class_paths"
+
+
+def class_package(entry: str) -> str | None:
+    """`com/example/util/StringUtils.class` -> `com.example.util` (pure).
+
+    None for classes in the default package, `module-info` / `package-info`,
+    and META-INF content (multi-release `META-INF/versions/N/...` copies are
+    duplicates of the top-level classes)."""
+    if entry.startswith("META-INF/"):
+        return None
+    parts = entry.split("/")
+    if len(parts) < 2:
+        return None
+    if parts[-1] in ("module-info.class", "package-info.class"):
+        return None
+    pkg = parts[:-1]
+    if not all(p.isidentifier() for p in pkg):
+        return None
+    return ".".join(pkg)
+
+
+def collapse_packages(packages: set[str]) -> list[str]:
+    """Drop every package that has an ancestor in the set (pure).
+
+    The pattern `import org.apache.parquet.avro.` already matches every
+    sub-package, so the shallowest packages that actually hold classes are
+    enough."""
+    out = []
+    for pkg in sorted(packages):
+        parts = pkg.split(".")
+        if any(".".join(parts[:i]) in packages for i in range(1, len(parts))):
+            continue
+        out.append(pkg)
+    return out
 
 
 def _parse_export_package(zf: zipfile.ZipFile, package: str) -> list[str]:
