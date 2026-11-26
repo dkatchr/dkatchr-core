@@ -92,7 +92,7 @@ SCAN_TARBALL_MAX_MANIFEST_BYTES = 100 * 1024 * 1024
 # Reachability cache (per repo + SHA) stores the matched import patterns, so a
 # change to pattern generation must invalidate it. v2: Go subpackage-import
 # patterns ('"module/').
-REACHABILITY_CACHE_SCHEMA = 3   # v3: executed-program (command) patterns
+REACHABILITY_CACHE_SCHEMA = 4   # v4: Maven / NuGet import names at their real package depth
 
 # Cache directory — anchored to CWD by default. Override via --cache-dir.
 # Lives under data/cache to match the web layer (web/settings.py CACHE_DIR) and
@@ -469,6 +469,11 @@ REACHABILITY_SOURCE_EXTENSIONS: frozenset[str] = frozenset({
 # import names are version-stable in practice.
 REGISTRY_RESOLVER_WORKERS:      int = int(os.environ.get("DKATCHR_REGISTRY_RESOLVER_WORKERS", "6"))
 REGISTRY_RESOLVER_CACHE_SCHEMA: int = 2   # v2: entries carry "commands" (installed programs)
+# Per-ecosystem cache revisions: bumping one re-resolves only that ecosystem's
+# entries (a global bump would re-download every PyPI wheel / gem too).
+# maven/nuget 3: real package depth (was cut to two segments) and NuGet reads only
+# the package's OWN types (TypeDef), not the types it references (TypeRef).
+REGISTRY_RESOLVER_ECOSYSTEM_SCHEMA: dict[str, int] = {"maven": 3, "nuget": 3}
 
 # File path substrings (case-insensitive) that indicate a test file.
 # Conservative: only patterns whose presence in a path is a strong signal

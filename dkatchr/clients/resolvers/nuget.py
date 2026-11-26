@@ -7,10 +7,18 @@ under `Microsoft.AspNetCore.Mvc.*`. The .nupkg is a zip; its `lib/` folder
 contains the .NET assemblies (.dll); the assemblies' metadata tables list
 the actual namespaces. `dotnetfile` parses the CLR metadata tables.
 
+Only the package's OWN types count (the TypeDef table). The TypeRef table lists
+types the DLL REFERENCES — its dependencies' namespaces — so reading it made
+Scrutor "used" by any `using Microsoft.Extensions` (fixed in 0.8.5). Namespaces
+keep their real depth and are collapsed to the shallowest ones (`using
+Newtonsoft.Json` already matches `Newtonsoft.Json.Linq`); they used to be cut to
+two segments, so Microsoft.Extensions.Configuration.Json resolved to
+`Microsoft.Extensions`.
+
 Filtered out: CLR built-ins (`System`, `Microsoft.CSharp`,
-`Microsoft.VisualBasic`) and `<Module>`. Truncated to two dot-separated
-segments to avoid over-specific patterns like `Newtonsoft.Json.Linq` that
-would miss `using Newtonsoft.Json;`.
+`Microsoft.VisualBasic`), `<Module>`, resource-only `FxResources.*` and the
+attribute types the compiler embeds in every assembly
+(`Microsoft.CodeAnalysis.EmbeddedAttribute`, unless the package IS Roslyn).
 
 Does NOT: handle .NET native images, signed catalog files, or analyzer
 DLLs (those live outside `lib/`).
@@ -112,7 +120,7 @@ class NuGetResolver(RegistryResolverBase):
                     log(f"[resolver] nuget/{package}: parse error — {entry}: {e}")
                     continue
 
-        cleaned = _filter_namespaces(namespaces)
+        cleaned = _filter_namespaces(namespaces, package)
         if not cleaned and dll_entries:
             # All DLLs failed to yield namespaces — most common cause is mixed-mode
             # C++/CLI assemblies (e.g. CefSharp, OpenCV wrappers) which interleave
@@ -151,7 +159,7 @@ def _extract_namespaces(dll_bytes: bytes, dotnet_pe_cls) -> set[str]:
     lookup = getattr(pe, "metadata_tables_lookup", None)
     if not isinstance(lookup, dict):
         return out
-    for table_name in ("TypeRef", "TypeDef"):
+    for table_name in ("TypeDef",):
         table = lookup.get(table_name)
         if table is None:
             continue
@@ -198,9 +206,11 @@ def _namespace_from_package_id(package_id: str) -> str | None:
     return truncated
 
 
-def _filter_namespaces(namespaces: set[str]) -> set[str]:
-    """Drop CLR built-ins / `<Module>`. Truncate to first two dot-segments."""
+def _filter_namespaces(namespaces: set[str], package_id: str = "") -> set[str]:
+    """Drop CLR built-ins, `<Module>`, resource and compiler-embedded namespaces;
+    keep the shallowest remaining namespaces at their real depth."""
     result: set[str] = set()
+    roslyn = package_id.lower().startswith("microsoft.codeanalysis")
     for ns in namespaces:
         if not ns or ns == "<Module>":
             continue
@@ -210,7 +220,11 @@ def _filter_namespaces(namespaces: set[str]) -> set[str]:
         # Also drop the deeper builtin forms (Microsoft.CSharp.RuntimeBinder etc).
         if any(ns == b or ns.startswith(b + ".") for b in _CLR_BUILTINS):
             continue
-        parts = ns.split(".")
-        truncated = ".".join(parts[:2])
-        result.add(truncated)
-    return result
+        if ns.startswith("FxResources."):
+            continue
+        if ns == "Microsoft.CodeAnalysis" and not roslyn:
+            continue
+        result.add(ns)
+    return {ns for ns in result
+            if not any(".".join(ns.split(".")[:i]) in result
+                       for i in range(1, ns.count(".") + 1))}
