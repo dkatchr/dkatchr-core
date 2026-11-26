@@ -35,6 +35,7 @@ import os
 import re
 
 from dkatchr.config import (
+    THIRD_PARTY_DIRS,
     IMAGE_REGISTRY_DEFAULT,
     RUNTIME_DEPLOY_PATH_HINTS,
     RUNTIME_VERSION_FILES,
@@ -58,8 +59,7 @@ _PROJECT = (".csproj", ".fsproj", ".vbproj")
 # Third-party code vendored into the repo: a dependency's package.json
 # `engines` or go.mod `go` line says what THAT library supports, not what this
 # repo runs on.
-_THIRD_PARTY_DIRS = {"node_modules", "vendor", "bower_components", "site-packages", ".venv",
-                     "venv", "third_party", "third-party", "jspm_packages", ".bundle"}
+_THIRD_PARTY_DIRS = THIRD_PARTY_DIRS
 
 
 def is_runtime_source(path: str) -> bool:

@@ -92,7 +92,17 @@ SCAN_TARBALL_MAX_MANIFEST_BYTES = 100 * 1024 * 1024
 # Reachability cache (per repo + SHA) stores the matched import patterns, so a
 # change to pattern generation must invalidate it. v2: Go subpackage-import
 # patterns ('"module/').
-REACHABILITY_CACHE_SCHEMA = 4   # v4: Maven / NuGet import names at their real package depth
+REACHABILITY_CACHE_SCHEMA = 5   # v5: vendored third-party dirs are not searched
+# Third-party code committed into a repo (node_modules/, Go vendor/, ...). Its
+# imports are not the repo's own use of a package — Level 1 counted a Go library
+# "used" because a vendored copy of another library imported it, and Level 2
+# found the vulnerable call inside the vulnerable package's own vendored source.
+# Transitive use through such code is the dependency graph's job. Also read by
+# the runtime parser (a vendored package.json `engines` is not this repo's runtime).
+THIRD_PARTY_DIRS: frozenset[str] = frozenset({
+    "node_modules", "vendor", "bower_components", "site-packages", ".venv", "venv",
+    "third_party", "third-party", "jspm_packages", ".bundle",
+})
 
 # Cache directory — anchored to CWD by default. Override via --cache-dir.
 # Lives under data/cache to match the web layer (web/settings.py CACHE_DIR) and
