@@ -26,6 +26,7 @@ class KEVClient:
         self._catalog_path = os.path.join(cache_dir, "kev_catalog.json")
         self._meta_path = os.path.join(cache_dir, "kev_meta.json")
         self._cve_set: set[str] | None = None
+        self._entries: list[dict] = []
         os.makedirs(cache_dir, exist_ok=True)
 
     # ---- public API ---------------------------------------------------------
@@ -40,21 +41,25 @@ class KEVClient:
             return self._cve_set
 
         # Try fresh cache first
-        cached = self._read_cache()
+        cached_data = self._read_cache_data()
+        cached = self._extract_cve_ids(cached_data) if cached_data is not None else None
         if cached is not None and self._is_cache_fresh():
             self._cve_set = cached
+            self._entries = self._extract_entries(cached_data)
             log(f"[+] KEV: loaded {len(cached)} CVEs from cache")
             return self._cve_set
 
         # Try downloading
         downloaded = self._download()
         if downloaded is not None:
-            self._cve_set = downloaded
+            self._cve_set = self._extract_cve_ids(downloaded)
+            self._entries = self._extract_entries(downloaded)
             return self._cve_set
 
         # Fall back to stale cache
         if cached is not None:
             self._cve_set = cached
+            self._entries = self._extract_entries(cached_data)
             log(f"[!] KEV: using stale cache ({len(cached)} CVEs)")
             return self._cve_set
 
@@ -62,6 +67,13 @@ class KEVClient:
         log("[!] KEV: no catalog available — KEV cross-reference will be empty")
         self._cve_set = set()
         return self._cve_set
+
+    def recent(self, limit: int = 10) -> list[dict]:
+        """The newest KEV additions, newest first: [{cve_id, name, vendor,
+        product, date_added (YYYY-MM-DD), known_ransomware}]. Same
+        fresh -> download -> stale -> empty strategy as load(); never raises."""
+        self.load()
+        return self._entries[: max(0, int(limit))]
 
     def check_vuln(self, vuln_id: str, aliases: str) -> bool:
         """Check whether a vulnerability (by ID or aliases) is in KEV.
@@ -97,18 +109,18 @@ class KEVClient:
         except Exception:
             return False
 
-    def _read_cache(self) -> set[str] | None:
+    def _read_cache_data(self) -> dict | None:
         if not os.path.exists(self._catalog_path):
             return None
         try:
             with open(self._catalog_path, encoding="utf-8") as f:
                 data = json.load(f)
-            return self._extract_cve_ids(data)
+            return data if isinstance(data, dict) else None
         except Exception as e:
             log(f"[!] KEV: cache read error: {e}")
             return None
 
-    def _download(self) -> set[str] | None:
+    def _download(self) -> dict | None:
         log("[+] KEV: downloading CISA KEV catalog…")
         try:
             resp = requests.get(KEV_CATALOG_URL, timeout=30)
@@ -118,8 +130,10 @@ class KEVClient:
             log(f"[!] KEV: download failed: {e}")
             return None
 
-        cve_set = self._extract_cve_ids(data)
-        log(f"[+] KEV: downloaded {len(cve_set)} CVEs")
+        if not isinstance(data, dict):
+            log("[!] KEV: unexpected catalog format")
+            return None
+        log(f"[+] KEV: downloaded {len(self._extract_cve_ids(data))} CVEs")
 
         # Persist to cache
         try:
@@ -135,9 +149,27 @@ class KEVClient:
         except Exception as e:
             log(f"[!] KEV: cache write error: {e}")
 
-        return cve_set
+        return data
 
     @staticmethod
     def _extract_cve_ids(data: dict) -> set[str]:
         vulns = data.get("vulnerabilities") or []
         return {v["cveID"] for v in vulns if isinstance(v, dict) and v.get("cveID")}
+
+    @staticmethod
+    def _extract_entries(data: dict | None) -> list[dict]:
+        """Catalog entries newest first (by dateAdded, then CVE id)."""
+        out = []
+        for v in (data or {}).get("vulnerabilities") or []:
+            if not isinstance(v, dict) or not v.get("cveID"):
+                continue
+            out.append({
+                "cve_id": v["cveID"],
+                "name": v.get("vulnerabilityName") or "",
+                "vendor": v.get("vendorProject") or "",
+                "product": v.get("product") or "",
+                "date_added": v.get("dateAdded") or "",
+                "known_ransomware": (v.get("knownRansomwareCampaignUse") or "").lower() == "known",
+            })
+        out.sort(key=lambda e: (e["date_added"], e["cve_id"]), reverse=True)
+        return out
