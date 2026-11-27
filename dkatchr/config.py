@@ -403,6 +403,13 @@ REACHABILITY_TARBALL_MAX_BYTES: int = int(
 )  # 1GB default. The tarball is streamed through tarfile without ever being
    # held in memory, so this cap is a safety belt against runaway streams,
    # not a RAM budget. Override via env if you scan even bigger monorepos.
+# A dropped connection mid-download used to mark EVERY finding of the repo UNKNOWN
+# (seen live: "Connection reset by peer" on a 1.3 GB tarball). Transient failures
+# (network errors, broken streams, HTTP 5xx / 429) are retried with backoff;
+# permanent ones (404, 403, size cap) are not.
+REACHABILITY_TARBALL_ATTEMPTS: int = int(os.environ.get("DKATCHR_REACHABILITY_TARBALL_ATTEMPTS", "3"))
+REACHABILITY_TARBALL_RETRY_BACKOFF: float = float(
+    os.environ.get("DKATCHR_REACHABILITY_TARBALL_RETRY_BACKOFF", "5"))   # seconds, doubles per retry
 REACHABILITY_MAX_FILE_BYTES:    int = 2 * 1024 * 1024    # 2MB — skip individual files
 
 # Streaming progress tuning. Big chunks keep event volume low; small chunks
