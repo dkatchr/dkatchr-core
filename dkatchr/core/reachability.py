@@ -53,6 +53,7 @@ CLI/web concerns.
 """
 
 import tarfile
+import time
 from typing import Callable, IO
 
 import ahocorasick
@@ -67,6 +68,8 @@ from dkatchr.config import (
     REACHABILITY_COMMAND_FILE_SUFFIXES,
     REACHABILITY_COMMAND_MIN_LEN,
     REACHABILITY_MAX_FILE_BYTES,
+    REACHABILITY_TARBALL_ATTEMPTS,
+    REACHABILITY_TARBALL_RETRY_BACKOFF,
     REACHABILITY_SCAN_PROGRESS_EVERY,
     REACHABILITY_SNIPPET_MAX_CHARS,
     REACHABILITY_SOURCE_EXTENSIONS,
@@ -825,51 +828,34 @@ def enrich_reachability(
     automaton.make_automaton()
 
     # ---- 4+6. open streaming tarball + scan in one pass --------------
-    _emit({"phase": "tarball_downloading", "downloaded_bytes": 0, "total_bytes": None})
-    stream, dl_reason = github_client.open_repo_tarball_stream(
-        repo_full_name, ref=sha, on_progress=_dl_progress,
-    )
-    if stream is None:
-        _emit({"phase": "tarball_failed", "reason": dl_reason})
-        evidence = f"tarball_unavailable: {dl_reason}"
-        for row in vuln_rows:
-            row["reachability"]          = UNKNOWN
-            row["reachability_evidence"] = evidence
-        return vuln_rows
-
-    log(f"[reachability] {repo_full_name} streaming tarball...")
+    # Transient failures (dropped connection, 5xx, 429) are retried with backoff;
+    # each attempt starts from a clean match map so a half-read stream never leaks
+    # partial matches into the result.
     matches: dict[str, list[str]] = {}
-    stream_reason: str | None = None
-    try:
-        with stream:
-            try:
-                matches = _grep_tar_stream(
-                    stream, automaton, search_patterns, exclude_test_files,
-                    on_progress=on_progress,
-                    # Extra patterns need the complete per-file map (their
-                    # consumers derive per-file co-occurrence from it) — an
-                    # early-exited map would silently under-report.
-                    allow_early_exit=not extras,
-                    detail_patterns=frozenset(extras),
-                    detail_hits_out=extra_hits_out,
-                    command_patterns=frozenset(command_patterns),
-                    bare_command_patterns=frozenset(bare_command_patterns),
-                )
-            except TarballSizeExceeded as e:
-                stream_reason = e.reason
-            except Exception as e:
-                stream_reason = (
-                    stream.failure_reason
-                    or f"stream_error: {type(e).__name__}: {e}"[:200]
-                )
-                log(f"[reachability] {repo_full_name} stream aborted: {stream_reason}")
-    except Exception as e:
-        stream_reason = stream_reason or f"stream_error: {type(e).__name__}: {e}"[:200]
+    stream = None
+    failure: str | None = None
+    for attempt in range(1, max(1, REACHABILITY_TARBALL_ATTEMPTS) + 1):
+        if attempt > 1:
+            wait = REACHABILITY_TARBALL_RETRY_BACKOFF * (2 ** (attempt - 2))
+            _emit({"phase": "tarball_retry", "attempt": attempt,
+                   "attempts": REACHABILITY_TARBALL_ATTEMPTS, "reason": failure, "wait_seconds": wait})
+            log(f"[reachability] {repo_full_name} retrying download in {wait:.0f}s "
+                f"(attempt {attempt}/{REACHABILITY_TARBALL_ATTEMPTS}): {failure}")
+            time.sleep(wait)
+            if extra_hits_out is not None:
+                extra_hits_out.clear()
+        matches, stream, failure = _download_and_grep(
+            github_client, repo_full_name, sha, automaton, search_patterns, exclude_test_files,
+            extras, extra_hits_out, command_patterns, bare_command_patterns, on_progress,
+            _emit, _dl_progress,
+        )
+        if failure is None or not _transient_tarball_failure(failure):
+            break
 
-    if stream_reason is not None:
-        _emit({"phase": "tarball_failed", "reason": stream_reason,
+    if failure is not None:
+        _emit({"phase": "tarball_failed", "reason": failure,
                "bytes_read": getattr(stream, "bytes_read", 0)})
-        evidence = f"tarball_unavailable: {stream_reason}"
+        evidence = f"tarball_unavailable: {failure}"
         for row in vuln_rows:
             row["reachability"]          = UNKNOWN
             row["reachability_evidence"] = evidence
@@ -983,3 +969,50 @@ def _apply_results_to_rows(vuln_rows: list[dict], results: dict) -> None:
             continue
         row["reachability"]          = entry.get("label", UNKNOWN)
         row["reachability_evidence"] = "|".join(entry.get("evidence") or [])
+
+
+def _transient_tarball_failure(reason: str) -> bool:
+    """A download / stream failure worth retrying (pure)."""
+    return reason.startswith(("network_error", "stream_error", "http_5", "http_429"))
+
+
+def _download_and_grep(github_client, repo_full_name, sha, automaton, search_patterns,
+                       exclude_test_files, extras, extra_hits_out, command_patterns,
+                       bare_command_patterns, on_progress, _emit, _dl_progress):
+    """One download + grep attempt -> (matches, stream, failure_reason | None)."""
+    _emit({"phase": "tarball_downloading", "downloaded_bytes": 0, "total_bytes": None})
+    stream, dl_reason = github_client.open_repo_tarball_stream(
+        repo_full_name, ref=sha, on_progress=_dl_progress,
+    )
+    if stream is None:
+        return {}, None, dl_reason
+
+    log(f"[reachability] {repo_full_name} streaming tarball...")
+    matches: dict[str, list[str]] = {}
+    stream_reason: str | None = None
+    try:
+        with stream:
+            try:
+                matches = _grep_tar_stream(
+                    stream, automaton, search_patterns, exclude_test_files,
+                    on_progress=on_progress,
+                    # Extra patterns need the complete per-file map (their
+                    # consumers derive per-file co-occurrence from it) — an
+                    # early-exited map would silently under-report.
+                    allow_early_exit=not extras,
+                    detail_patterns=frozenset(extras),
+                    detail_hits_out=extra_hits_out,
+                    command_patterns=frozenset(command_patterns),
+                    bare_command_patterns=frozenset(bare_command_patterns),
+                )
+            except TarballSizeExceeded as e:
+                stream_reason = e.reason
+            except Exception as e:
+                stream_reason = (
+                    stream.failure_reason
+                    or f"stream_error: {type(e).__name__}: {e}"[:200]
+                )
+                log(f"[reachability] {repo_full_name} stream aborted: {stream_reason}")
+    except Exception as e:
+        stream_reason = stream_reason or f"stream_error: {type(e).__name__}: {e}"[:200]
+    return (matches if stream_reason is None else {}), stream, stream_reason
